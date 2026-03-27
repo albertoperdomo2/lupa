@@ -6,9 +6,11 @@ import remarkGfm from "remark-gfm";
 import {
   Bot,
   Camera,
+  ChevronRight,
   CornerDownLeft,
   Paperclip,
   Sparkles,
+  Trash2,
   User,
   X,
 } from "lucide-react";
@@ -29,9 +31,12 @@ export interface ChatPanelMessage {
 interface ChatPanelProps {
   enabled: boolean;
   model: string;
+  mode: "single" | "deep";
   hasTrace: boolean;
   currentTraceLabel?: string;
   previousTraceLabel?: string;
+  baselineTraceLabel?: string;
+  candidateTraceLabel?: string;
   messages: ChatPanelMessage[];
   attachments: TraceChatAttachment[];
   isBusy: boolean;
@@ -40,14 +45,18 @@ interface ChatPanelProps {
   onRemoveAttachment: (attachmentId: string) => void;
   onSendMessage: (message: string) => Promise<void>;
   onStartAreaCapture: () => void;
+  onClearHistory: () => void;
 }
 
 export function ChatPanel({
   enabled,
   model,
+  mode,
   hasTrace,
   currentTraceLabel,
   previousTraceLabel,
+  baselineTraceLabel,
+  candidateTraceLabel,
   messages,
   attachments,
   isBusy,
@@ -56,6 +65,7 @@ export function ChatPanel({
   onRemoveAttachment,
   onSendMessage,
   onStartAreaCapture,
+  onClearHistory,
 }: ChatPanelProps) {
   const [draft, setDraft] = useState("");
   const endRef = useRef<HTMLDivElement | null>(null);
@@ -75,12 +85,24 @@ export function ChatPanel({
       return "Load a trace and ask what the flame graph means, or ask how to use the viewer.";
     }
 
+    if (mode === "deep" && (baselineTraceLabel || candidateTraceLabel)) {
+      return `Deep compare: ${baselineTraceLabel ?? "baseline"} vs ${candidateTraceLabel ?? "candidate"}.`;
+    }
+
     if (previousTraceLabel) {
       return `Current trace: ${currentTraceLabel ?? "loaded trace"}. Previous trace kept for comparison: ${previousTraceLabel}.`;
     }
 
     return `Current trace: ${currentTraceLabel ?? "loaded trace"}.`;
-  }, [currentTraceLabel, enabled, hasTrace, previousTraceLabel]);
+  }, [
+    baselineTraceLabel,
+    candidateTraceLabel,
+    currentTraceLabel,
+    enabled,
+    hasTrace,
+    mode,
+    previousTraceLabel,
+  ]);
 
   async function handleSubmit() {
     const message = draft.trim();
@@ -101,9 +123,23 @@ export function ChatPanel({
             <div className="text-[11px] text-[#666] truncate">{helperText}</div>
           </div>
         </div>
-        <Badge variant="outline" className="border-[#ccc] text-[#555] bg-white shrink-0">
-          {model}
-        </Badge>
+        <div className="flex items-center gap-2 shrink-0">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            disabled={isBusy || messages.length === 0}
+            onClick={onClearHistory}
+            className="h-7 w-7 rounded-sm text-[#666] hover:bg-[#e8e8e8] hover:text-[#333]"
+            title="Clear persisted chat history"
+            aria-label="Clear persisted chat history"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </Button>
+          <Badge variant="outline" className="border-[#ccc] text-[#555] bg-white shrink-0">
+            {model}
+          </Badge>
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 py-3">
@@ -111,9 +147,7 @@ export function ChatPanel({
           {messages.length === 0 ? (
             <EmptyPrompt enabled={enabled} hasTrace={hasTrace} />
           ) : (
-            messages.map((message) => (
-              <MessageBubble key={message.id} message={message} />
-            ))
+            <ChatTranscript messages={messages} />
           )}
 
           {isBusy && (
@@ -205,6 +239,57 @@ export function ChatPanel({
         </div>
       </div>
     </div>
+  );
+}
+
+function ChatTranscript({ messages }: { messages: ChatPanelMessage[] }) {
+  const blocks: Array<
+    | { type: "message"; message: ChatPanelMessage }
+    | { type: "tool-group"; messages: ChatPanelMessage[] }
+  > = [];
+
+  let toolBuffer: ChatPanelMessage[] = [];
+
+  for (const message of messages) {
+    if (message.role === "tool") {
+      toolBuffer.push(message);
+      continue;
+    }
+
+    if (toolBuffer.length > 0) {
+      blocks.push({
+        type: "tool-group",
+        messages: toolBuffer,
+      });
+      toolBuffer = [];
+    }
+
+    blocks.push({
+      type: "message",
+      message,
+    });
+  }
+
+  if (toolBuffer.length > 0) {
+    blocks.push({
+      type: "tool-group",
+      messages: toolBuffer,
+    });
+  }
+
+  return (
+    <>
+      {blocks.map((block, index) =>
+        block.type === "message" ? (
+          <MessageBubble key={block.message.id} message={block.message} />
+        ) : (
+          <ToolMessageGroup
+            key={`tool-group-${index}-${block.messages[0]?.id ?? "empty"}`}
+            messages={block.messages}
+          />
+        )
+      )}
+    </>
   );
 }
 
@@ -305,6 +390,33 @@ function MessageBubble({ message }: { message: ChatPanelMessage }) {
   );
 }
 
+function ToolMessageGroup({ messages }: { messages: ChatPanelMessage[] }) {
+  return (
+    <details className="rounded-sm border border-[#dddddd] bg-[#f7f7f7]">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2 text-xs text-[#555] [&::-webkit-details-marker]:hidden">
+        <div className="flex items-center gap-2">
+          <ChevronRight className="h-3.5 w-3.5 transition-transform duration-150 details-open:rotate-90" />
+          <span className="font-medium text-[#444]">Trace Agent steps</span>
+          <span className="text-[#777]">{messages.length}</span>
+        </div>
+        <span className="text-[11px] text-[#777]">Expand to inspect tool activity</span>
+      </summary>
+      <div className="border-t border-[#e3e3e3] px-3 py-2">
+        <div className="space-y-2">
+          {messages.map((message) => (
+            <div
+              key={message.id}
+              className="rounded-sm border border-[#e0e0e0] bg-white px-3 py-2 text-xs leading-5 text-[#666]"
+            >
+              {message.content}
+            </div>
+          ))}
+        </div>
+      </div>
+    </details>
+  );
+}
+
 function isStructuredMarkdownLine(line: string): boolean {
   const trimmed = line.trim();
   if (!trimmed) return false;
@@ -373,24 +485,47 @@ function renderTextWithMentions(content: string, inverted: boolean) {
     while ((match = mentionRegex.exec(line)) !== null) {
       const fullMatch = match[0];
       const mentionValue = match[1];
+      const separatorIndex = mentionValue.indexOf("|");
+      const mentionLabel =
+        separatorIndex === -1 ? mentionValue : mentionValue.slice(0, separatorIndex);
+      const mentionTitle =
+        separatorIndex === -1 ? mentionValue : mentionValue.slice(separatorIndex + 1);
 
       if (match.index > cursor) {
         parts.push(line.slice(cursor, match.index));
       }
 
       parts.push(
-        <span
-          key={`${mentionValue}-${match.index}`}
-          className={cn(
-            "inline-flex max-w-full items-center rounded-sm border px-1.5 py-0.5 align-middle font-mono text-[11px]",
-            inverted
-              ? "border-white/25 bg-white/12 text-white"
-              : "border-[#d8d8d8] bg-[#f6f6f6] text-[#444]"
-          )}
-          title={mentionValue}
-        >
-          {fullMatch}
-        </span>
+        separatorIndex === -1 ? (
+          <span
+            key={`${mentionValue}-${match.index}`}
+            className={cn(
+              "inline-flex max-w-full items-center rounded-sm border px-1.5 py-0.5 align-middle font-mono text-[11px]",
+              inverted
+                ? "border-white/25 bg-white/12 text-white"
+                : "border-[#d8d8d8] bg-[#f6f6f6] text-[#444]"
+            )}
+            title={mentionTitle}
+          >
+            @{mentionLabel}
+          </span>
+        ) : (
+          <a
+            key={`${mentionValue}-${match.index}`}
+            href={mentionTitle}
+            target="_blank"
+            rel="noreferrer"
+            className={cn(
+              "inline-flex max-w-full items-center rounded-sm border px-1.5 py-0.5 align-middle font-mono text-[11px] no-underline transition-colors",
+              inverted
+                ? "border-white/25 bg-white/12 text-white hover:bg-white/18"
+                : "border-[#d8d8d8] bg-[#f6f6f6] text-[#444] hover:bg-[#efefef]"
+            )}
+            title={mentionTitle}
+          >
+            @{mentionLabel}
+          </a>
+        )
       );
 
       cursor = match.index + fullMatch.length;

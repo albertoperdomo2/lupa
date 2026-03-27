@@ -9,7 +9,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { toCanvas } from "html-to-image";
-import type { TraceData, TraceEvent, Process, ViewState } from "@/lib/trace-types";
+import type { Process, TraceData, TraceEvent, ViewState } from "@/lib/trace-types";
 import type {
   AttachedTraceSummary,
   GitHubRepoMention,
@@ -20,9 +20,13 @@ import type {
   TraceChatStreamEvent,
   TraceChatToolCall,
   TraceChatToolResult,
+  TraceCompareMetadata,
+  TraceNormalizationMode,
+  TraceRole,
   TraceSnapshot,
 } from "@/lib/trace-chat";
 import {
+  buildProcessMap,
   buildTraceDiffSummary,
   buildTraceIndex,
   buildTraceSnapshot,
@@ -30,17 +34,27 @@ import {
   inspectTraceEvent,
   searchTraceEvents,
 } from "@/lib/trace-analysis";
+import {
+  buildTraceCompareReport,
+  buildTraceCompareReportExport,
+  findCompareFinding,
+  findCompareRegion,
+} from "@/lib/trace-compare";
+import { buildGitHubRepoMentionToken } from "@/lib/github-repo";
 import { formatTimeShort } from "@/lib/trace-types";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
-import { Toolbar } from "./toolbar";
-import { Timeline } from "./timeline";
-import { DetailsPanel } from "./details-panel";
-import { EmptyState } from "./empty-state";
-import { StatusBar } from "./status-bar";
-import { Minimap } from "./minimap";
-import { SideToolbar } from "./side-toolbar";
 import { ChatPanel } from "./chat-panel";
 import type { ChatPanelMessage } from "./chat-panel";
+import { CommandPalette } from "./command-palette";
+import { CompareControls } from "./compare-controls";
+import { CompareFindingsPanel } from "./compare-findings-panel";
+import { DetailsPanel } from "./details-panel";
+import { EmptyState } from "./empty-state";
+import { Minimap } from "./minimap";
+import { SideToolbar } from "./side-toolbar";
+import { StatusBar } from "./status-bar";
+import { Timeline } from "./timeline";
+import { TracePane } from "./trace-pane";
 
 interface TracingViewerProps {
   chatEnabled: boolean;
@@ -51,15 +65,35 @@ interface TimelineApi {
   captureImage: () => string | null;
 }
 
-interface ToolExecutionRuntime {
+type ViewerMode = "single" | "deep";
+type LoadTarget = "single" | "baseline" | "candidate";
+type RuntimeTargetKey = "single" | TraceRole;
+
+interface RuntimeTargetState {
   viewState: ViewState;
   selectedEvent: TraceEvent | null;
+}
+
+interface ToolExecutionRuntime {
+  mode: ViewerMode;
+  single: RuntimeTargetState;
+  baseline: RuntimeTargetState;
+  candidate: RuntimeTargetState;
 }
 
 interface ToolExecutionResult {
   output: unknown;
   logMessage: string;
   runtime: ToolExecutionRuntime;
+}
+
+interface TracePaneState {
+  traceData: TraceData | null;
+  traceLoadedAt: string | null;
+  filename?: string;
+  selectedEvent: TraceEvent | null;
+  tool: "select" | "pan";
+  viewState: ViewState;
 }
 
 interface CapturePoint {
@@ -74,6 +108,12 @@ interface CaptureRect {
   height: number;
 }
 
+interface PersistedChatSession {
+  messages: ChatPanelMessage[];
+  responseId: string | null;
+  repoMentions?: GitHubRepoMention[];
+}
+
 const TOOL_STEP_LIMIT = 6;
 const MIN_CAPTURE_SIZE_PX = 24;
 const GITHUB_URL_REGEX = /https?:\/\/github\.com\/[^\s<>()\]]+/gi;
@@ -82,6 +122,33 @@ const TRACE_AGENT_TRACE_STORAGE_KEY = "trace-agent-last-trace:v1";
 
 function createLocalId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function createDefaultViewState(): ViewState {
+  return {
+    startTime: 0,
+    endTime: 1_000_000,
+    scale: 1,
+  };
+}
+
+function createEmptyTracePaneState(): TracePaneState {
+  return {
+    traceData: null,
+    traceLoadedAt: null,
+    filename: undefined,
+    selectedEvent: null,
+    tool: "select",
+    viewState: createDefaultViewState(),
+  };
+}
+
+function createCompareMetadata(label: string): TraceCompareMetadata {
+  return {
+    traceId: createLocalId(label.toLowerCase().replace(/\s+/g, "-")),
+    label,
+    workloadKind: "unknown",
+  };
 }
 
 function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
@@ -111,7 +178,9 @@ function buildAttachedTraceSummary(trace: TraceSnapshot): AttachedTraceSummary {
     filename: trace.filename,
     loadedAt: trace.loadedAt,
     eventCount: trace.eventCount,
-    bounds: trace.bounds,
+    bounds: {
+      ...trace.bounds,
+    },
   };
 }
 
@@ -158,6 +227,88 @@ function cloneAttachment(attachment: TraceChatAttachment): TraceChatAttachment {
   };
 }
 
+function sanitizeAttachmentsForPersistence(
+  attachments: TraceChatAttachment[] | undefined
+): TraceChatAttachment[] | undefined {
+  if (!attachments?.length) return undefined;
+
+  const persistentAttachments = attachments
+    .filter((attachment) => attachment.kind !== "image")
+    .map(cloneAttachment);
+
+  return persistentAttachments.length > 0 ? persistentAttachments : undefined;
+}
+
+function sanitizeMessageForPersistence(message: ChatPanelMessage): ChatPanelMessage {
+  return {
+    ...message,
+    attachments: sanitizeAttachmentsForPersistence(message.attachments),
+  };
+}
+
+function buildTimeBounds(traceData: TraceData | null): { min: number; max: number } {
+  if (!traceData || traceData.traceEvents.length === 0) {
+    return { min: 0, max: 1_000_000 };
+  }
+
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+
+  for (const event of traceData.traceEvents) {
+    if (event.ph === "M") continue;
+    min = Math.min(min, event.ts);
+    max = Math.max(max, event.ts + (event.dur ?? 0));
+  }
+
+  if (!Number.isFinite(min) || !Number.isFinite(max)) {
+    return { min: 0, max: 1_000_000 };
+  }
+
+  return { min, max };
+}
+
+function fitViewStateToBounds(bounds: { min: number; max: number }, paddingRatio: number): ViewState {
+  const duration = Math.max(bounds.max - bounds.min, 1);
+  const padding = duration * paddingRatio;
+
+  return {
+    startTime: bounds.min - padding,
+    endTime: bounds.max + padding,
+    scale: 1,
+  };
+}
+
+function buildDefaultViewState(traceData: TraceData): ViewState {
+  return fitViewStateToBounds(buildTimeBounds(traceData), 0.05);
+}
+
+function zoomViewState(viewState: ViewState, factor: number): ViewState {
+  const center = (viewState.startTime + viewState.endTime) / 2;
+  const duration = Math.max(viewState.endTime - viewState.startTime, 1);
+  const nextDuration = Math.max(duration * factor, 1_000);
+
+  return {
+    startTime: center - nextDuration / 2,
+    endTime: center + nextDuration / 2,
+    scale: 1,
+  };
+}
+
+function panViewState(viewState: ViewState, ratio: number): ViewState {
+  const duration = viewState.endTime - viewState.startTime;
+  const delta = duration * ratio;
+
+  return {
+    ...viewState,
+    startTime: viewState.startTime + delta,
+    endTime: viewState.endTime + delta,
+  };
+}
+
+function isTraceRole(value: unknown): value is TraceRole {
+  return value === "baseline" || value === "candidate";
+}
+
 function resolveTraceEventId(
   traceIndex: NonNullable<ReturnType<typeof buildTraceIndex>>,
   event: TraceEvent | null
@@ -198,7 +349,7 @@ function extractGitHubMentions(message: string): {
     displayMessage += message.slice(cursor, matchIndex);
 
     if (/^https?:\/\/github\.com\/[^/\s]+\/[^/\s]+/i.test(normalizedUrl)) {
-      displayMessage += `@[${normalizedUrl}]`;
+      displayMessage += buildGitHubRepoMentionToken(normalizedUrl) ?? `@[${normalizedUrl}]`;
       if (!seenUrls.has(normalizedUrl)) {
         seenUrls.add(normalizedUrl);
         repoMentions.push({
@@ -222,172 +373,284 @@ function extractGitHubMentions(message: string): {
   };
 }
 
-function sanitizeAttachmentsForPersistence(
-  attachments: TraceChatAttachment[] | undefined
-): TraceChatAttachment[] | undefined {
-  if (!attachments?.length) return undefined;
+function mergeRepoMentions(
+  existingMentions: GitHubRepoMention[],
+  nextMentions: GitHubRepoMention[]
+): GitHubRepoMention[] {
+  const merged = [...existingMentions];
+  const seenUrls = new Set(existingMentions.map((mention) => mention.url));
 
-  const persistentAttachments = attachments
-    .filter((attachment) => attachment.kind !== "image")
-    .map(cloneAttachment);
+  for (const mention of nextMentions) {
+    if (seenUrls.has(mention.url)) continue;
+    seenUrls.add(mention.url);
+    merged.push(mention);
+  }
 
-  return persistentAttachments.length > 0 ? persistentAttachments : undefined;
+  return merged;
 }
 
 export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
-  const [traceData, setTraceData] = useState<TraceData | null>(null);
-  const [traceLoadedAt, setTraceLoadedAt] = useState<string | null>(null);
+  const [mode, setMode] = useState<ViewerMode>("single");
+  const [singleTrace, setSingleTrace] = useState<TracePaneState>(() => createEmptyTracePaneState());
+  const [baselineTrace, setBaselineTrace] = useState<TracePaneState>(() =>
+    createEmptyTracePaneState()
+  );
+  const [candidateTrace, setCandidateTrace] = useState<TracePaneState>(() =>
+    createEmptyTracePaneState()
+  );
   const [previousTraceSnapshot, setPreviousTraceSnapshot] = useState<TraceSnapshot | null>(null);
-  const [selectedEvent, setSelectedEvent] = useState<TraceEvent | null>(null);
-  const [tool, setTool] = useState<"select" | "pan">("select");
+  const [baselineMetadata, setBaselineMetadata] = useState<TraceCompareMetadata>(() =>
+    createCompareMetadata("Baseline")
+  );
+  const [candidateMetadata, setCandidateMetadata] = useState<TraceCompareMetadata>(() =>
+    createCompareMetadata("Candidate")
+  );
+  const [normalizationMode, setNormalizationMode] =
+    useState<TraceNormalizationMode>("total");
   const [searchQuery, setSearchQuery] = useState("");
-  const [filename, setFilename] = useState<string | undefined>();
-  const [showFlowEvents, setShowFlowEvents] = useState(false);
-  const [showProcesses, setShowProcesses] = useState(true);
-  const [viewState, setViewState] = useState<ViewState>({
-    startTime: 0,
-    endTime: 1000000,
-    scale: 1,
-  });
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatPanelMessage[]>([]);
   const [chatBusy, setChatBusy] = useState(false);
   const [chatErrorMessage, setChatErrorMessage] = useState<string | null>(null);
   const [chatResponseId, setChatResponseId] = useState<string | null>(null);
-  const [timelineApi, setTimelineApi] = useState<TimelineApi | null>(null);
+  const [attachedRepos, setAttachedRepos] = useState<GitHubRepoMention[]>([]);
+  const [singleTimelineApi, setSingleTimelineApi] = useState<TimelineApi | null>(null);
+  const [baselineTimelineApi, setBaselineTimelineApi] = useState<TimelineApi | null>(null);
+  const [candidateTimelineApi, setCandidateTimelineApi] = useState<TimelineApi | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<TraceChatAttachment[]>([]);
   const [isCaptureMode, setIsCaptureMode] = useState(false);
   const [captureOrigin, setCaptureOrigin] = useState<CapturePoint | null>(null);
   const [captureCurrent, setCaptureCurrent] = useState<CapturePoint | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const loadTargetRef = useRef<LoadTarget>("single");
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const hasRestoredPersistentChatRef = useRef(false);
 
-  const processes = useMemo(() => {
-    if (!traceData) return new Map<number, Process>();
-
-    const processMap = new Map<number, Process>();
-
-    for (const event of traceData.traceEvents) {
-      if (event.ph === "M") {
-        if (event.name === "process_name") {
-          if (!processMap.has(event.pid)) {
-            processMap.set(event.pid, {
-              pid: event.pid,
-              name: String(event.args?.name || `Process ${event.pid}`),
-              threads: new Map(),
-            });
-          } else {
-            const process = processMap.get(event.pid)!;
-            process.name = String(event.args?.name || process.name);
-          }
-        } else if (event.name === "thread_name") {
-          if (!processMap.has(event.pid)) {
-            processMap.set(event.pid, {
-              pid: event.pid,
-              name: `Process ${event.pid}`,
-              threads: new Map(),
-            });
-          }
-          const process = processMap.get(event.pid)!;
-          if (!process.threads.has(event.tid)) {
-            process.threads.set(event.tid, {
-              pid: event.pid,
-              tid: event.tid,
-              name: String(event.args?.name || `Thread ${event.tid}`),
-              events: [],
-            });
-          } else {
-            const thread = process.threads.get(event.tid)!;
-            thread.name = String(event.args?.name || thread.name);
-          }
-        }
-      }
-    }
-
-    for (const event of traceData.traceEvents) {
-      if (event.ph === "M") continue;
-
-      if (!processMap.has(event.pid)) {
-        processMap.set(event.pid, {
-          pid: event.pid,
-          name: `Process ${event.pid}`,
-          threads: new Map(),
-        });
-      }
-
-      const process = processMap.get(event.pid)!;
-
-      if (!process.threads.has(event.tid)) {
-        process.threads.set(event.tid, {
-          pid: event.pid,
-          tid: event.tid,
-          name: `Thread ${event.tid}`,
-          events: [],
-        });
-      }
-
-      process.threads.get(event.tid)!.events.push(event);
-    }
-
-    for (const process of processMap.values()) {
-      for (const [tid, thread] of process.threads) {
-        if (thread.events.length === 0) {
-          process.threads.delete(tid);
-          continue;
-        }
-
-        thread.events.sort((a, b) => a.ts - b.ts);
-      }
-    }
-
-    for (const [pid, process] of processMap) {
-      if (process.threads.size === 0) {
-        processMap.delete(pid);
-      }
-    }
-
-    return processMap;
-  }, [traceData]);
-
-  const traceIndex = useMemo(() => buildTraceIndex(traceData, processes), [traceData, processes]);
-
-  const currentTraceSnapshot = useMemo(() => {
-    if (!traceData || !traceIndex) return null;
-
-    return buildTraceSnapshot(traceData, traceIndex, {
-      label: filename ?? "Current trace",
-      filename,
-      loadedAt: traceLoadedAt ?? undefined,
-    });
-  }, [filename, traceData, traceIndex, traceLoadedAt]);
-
-  const currentSelectedEventId = useMemo(() => {
-    if (!selectedEvent || !traceIndex) return null;
-    return resolveTraceEventId(traceIndex, selectedEvent);
-  }, [selectedEvent, traceIndex]);
-
-  const currentViewSummary = useMemo(() => {
-    if (!traceIndex) return null;
-    return buildViewportSummary(traceIndex, {
-      viewState,
-      selectedEventId: currentSelectedEventId,
-      searchQuery,
-    });
-  }, [currentSelectedEventId, searchQuery, traceIndex, viewState]);
-
-  const comparisonToPrevious = useMemo(
-    () => buildTraceDiffSummary(previousTraceSnapshot, currentTraceSnapshot),
-    [currentTraceSnapshot, previousTraceSnapshot]
+  const singleProcesses = useMemo(
+    () => buildProcessMap(singleTrace.traceData),
+    [singleTrace.traceData]
+  );
+  const baselineProcesses = useMemo(
+    () => buildProcessMap(baselineTrace.traceData),
+    [baselineTrace.traceData]
+  );
+  const candidateProcesses = useMemo(
+    () => buildProcessMap(candidateTrace.traceData),
+    [candidateTrace.traceData]
   );
 
-  const chatContext = useMemo<TraceChatContext>(
+  const singleTraceIndex = useMemo(
+    () => buildTraceIndex(singleTrace.traceData, singleProcesses),
+    [singleProcesses, singleTrace.traceData]
+  );
+  const baselineTraceIndex = useMemo(
+    () => buildTraceIndex(baselineTrace.traceData, baselineProcesses),
+    [baselineProcesses, baselineTrace.traceData]
+  );
+  const candidateTraceIndex = useMemo(
+    () => buildTraceIndex(candidateTrace.traceData, candidateProcesses),
+    [candidateProcesses, candidateTrace.traceData]
+  );
+
+  const singleTraceSnapshot = useMemo(() => {
+    if (!singleTrace.traceData || !singleTraceIndex) return null;
+
+    return buildTraceSnapshot(singleTrace.traceData, singleTraceIndex, {
+      label: singleTrace.filename ?? "Current trace",
+      filename: singleTrace.filename,
+      loadedAt: singleTrace.traceLoadedAt ?? undefined,
+    });
+  }, [singleTrace.filename, singleTrace.traceData, singleTrace.traceLoadedAt, singleTraceIndex]);
+
+  const baselineTraceSnapshot = useMemo(() => {
+    if (!baselineTrace.traceData || !baselineTraceIndex) return null;
+
+    return buildTraceSnapshot(baselineTrace.traceData, baselineTraceIndex, {
+      label: baselineTrace.filename ?? "Baseline trace",
+      filename: baselineTrace.filename,
+      loadedAt: baselineTrace.traceLoadedAt ?? undefined,
+    });
+  }, [
+    baselineTrace.filename,
+    baselineTrace.traceData,
+    baselineTrace.traceLoadedAt,
+    baselineTraceIndex,
+  ]);
+
+  const candidateTraceSnapshot = useMemo(() => {
+    if (!candidateTrace.traceData || !candidateTraceIndex) return null;
+
+    return buildTraceSnapshot(candidateTrace.traceData, candidateTraceIndex, {
+      label: candidateTrace.filename ?? "Candidate trace",
+      filename: candidateTrace.filename,
+      loadedAt: candidateTrace.traceLoadedAt ?? undefined,
+    });
+  }, [
+    candidateTrace.filename,
+    candidateTrace.traceData,
+    candidateTrace.traceLoadedAt,
+    candidateTraceIndex,
+  ]);
+
+  const baselineCompareMetadata = useMemo<TraceCompareMetadata>(
     () => ({
-      currentTrace: currentTraceSnapshot,
-      previousTrace: previousTraceSnapshot,
-      currentView: currentViewSummary,
-      comparisonToPrevious,
+      ...baselineMetadata,
+      traceId: baselineTraceSnapshot?.id ?? baselineMetadata.traceId,
+      label: baselineTraceSnapshot?.label ?? baselineMetadata.label,
     }),
-    [comparisonToPrevious, currentTraceSnapshot, currentViewSummary, previousTraceSnapshot]
+    [baselineMetadata, baselineTraceSnapshot]
+  );
+
+  const candidateCompareMetadata = useMemo<TraceCompareMetadata>(
+    () => ({
+      ...candidateMetadata,
+      traceId: candidateTraceSnapshot?.id ?? candidateMetadata.traceId,
+      label: candidateTraceSnapshot?.label ?? candidateMetadata.label,
+    }),
+    [candidateMetadata, candidateTraceSnapshot]
+  );
+
+  const singleSelectedEventId = useMemo(() => {
+    if (!singleTrace.selectedEvent || !singleTraceIndex) return null;
+    return resolveTraceEventId(singleTraceIndex, singleTrace.selectedEvent);
+  }, [singleTrace.selectedEvent, singleTraceIndex]);
+
+  const baselineSelectedEventId = useMemo(() => {
+    if (!baselineTrace.selectedEvent || !baselineTraceIndex) return null;
+    return resolveTraceEventId(baselineTraceIndex, baselineTrace.selectedEvent);
+  }, [baselineTrace.selectedEvent, baselineTraceIndex]);
+
+  const candidateSelectedEventId = useMemo(() => {
+    if (!candidateTrace.selectedEvent || !candidateTraceIndex) return null;
+    return resolveTraceEventId(candidateTraceIndex, candidateTrace.selectedEvent);
+  }, [candidateTrace.selectedEvent, candidateTraceIndex]);
+
+  const singleViewSummary = useMemo(() => {
+    if (!singleTraceIndex) return null;
+    return buildViewportSummary(singleTraceIndex, {
+      viewState: singleTrace.viewState,
+      selectedEventId: singleSelectedEventId,
+      searchQuery,
+    });
+  }, [searchQuery, singleSelectedEventId, singleTrace.viewState, singleTraceIndex]);
+
+  const baselineViewSummary = useMemo(() => {
+    if (!baselineTraceIndex) return null;
+    return buildViewportSummary(baselineTraceIndex, {
+      viewState: baselineTrace.viewState,
+      selectedEventId: baselineSelectedEventId,
+      searchQuery,
+    });
+  }, [baselineSelectedEventId, baselineTrace.viewState, baselineTraceIndex, searchQuery]);
+
+  const candidateViewSummary = useMemo(() => {
+    if (!candidateTraceIndex) return null;
+    return buildViewportSummary(candidateTraceIndex, {
+      viewState: candidateTrace.viewState,
+      selectedEventId: candidateSelectedEventId,
+      searchQuery,
+    });
+  }, [candidateSelectedEventId, candidateTrace.viewState, candidateTraceIndex, searchQuery]);
+
+  const comparisonToPrevious = useMemo(
+    () => buildTraceDiffSummary(previousTraceSnapshot, singleTraceSnapshot),
+    [previousTraceSnapshot, singleTraceSnapshot]
+  );
+
+  const deepCompareReport = useMemo(
+    () =>
+      buildTraceCompareReport({
+        baselineTrace:
+          baselineTraceSnapshot && baselineTraceIndex
+            ? {
+                role: "baseline",
+                snapshot: baselineTraceSnapshot,
+                index: baselineTraceIndex,
+                metadata: baselineCompareMetadata,
+              }
+            : null,
+        candidateTrace:
+          candidateTraceSnapshot && candidateTraceIndex
+            ? {
+                role: "candidate",
+                snapshot: candidateTraceSnapshot,
+                index: candidateTraceIndex,
+                metadata: candidateCompareMetadata,
+              }
+            : null,
+        normalizationMode,
+      }),
+    [
+      baselineCompareMetadata,
+      baselineTraceIndex,
+      baselineTraceSnapshot,
+      candidateCompareMetadata,
+      candidateTraceIndex,
+      candidateTraceSnapshot,
+      normalizationMode,
+    ]
+  );
+
+  const chatContext = useMemo<TraceChatContext>(() => {
+    if (mode === "deep") {
+      return {
+        currentTrace: candidateTraceSnapshot,
+        previousTrace: baselineTraceSnapshot,
+        currentView: candidateViewSummary,
+        comparisonToPrevious: buildTraceDiffSummary(
+          baselineTraceSnapshot,
+          candidateTraceSnapshot
+        ),
+        deepCompare: {
+          enabled: true,
+          baselineTrace: baselineTraceSnapshot,
+          candidateTrace: candidateTraceSnapshot,
+          baselineView: baselineViewSummary,
+          candidateView: candidateViewSummary,
+          metadata: {
+            baseline: baselineTraceSnapshot ? baselineCompareMetadata : null,
+            candidate: candidateTraceSnapshot ? candidateCompareMetadata : null,
+          },
+          normalizationMode,
+          report: deepCompareReport,
+        },
+      };
+    }
+
+    return {
+      currentTrace: singleTraceSnapshot,
+      previousTrace: previousTraceSnapshot,
+      currentView: singleViewSummary,
+      comparisonToPrevious,
+      deepCompare: null,
+    };
+  }, [
+    baselineCompareMetadata,
+    baselineTraceSnapshot,
+    baselineViewSummary,
+    candidateCompareMetadata,
+    candidateTraceSnapshot,
+    candidateViewSummary,
+    comparisonToPrevious,
+    deepCompareReport,
+    mode,
+    normalizationMode,
+    previousTraceSnapshot,
+    singleTraceSnapshot,
+    singleViewSummary,
+  ]);
+
+  const singleTimeBounds = useMemo(
+    () => buildTimeBounds(singleTrace.traceData),
+    [singleTrace.traceData]
+  );
+  const baselineTimeBounds = useMemo(
+    () => buildTimeBounds(baselineTrace.traceData),
+    [baselineTrace.traceData]
+  );
+  const candidateTimeBounds = useMemo(
+    () => buildTimeBounds(candidateTrace.traceData),
+    [candidateTrace.traceData]
   );
 
   const captureRect = useMemo(
@@ -395,124 +658,210 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
     [captureCurrent, captureOrigin]
   );
 
-  const timeBounds = useMemo(() => {
-    if (!traceData || traceData.traceEvents.length === 0) {
-      return { min: 0, max: 1000000 };
-    }
-
-    let min = Infinity;
-    let max = -Infinity;
-
-    for (const event of traceData.traceEvents) {
-      if (event.ph === "M") continue;
-      min = Math.min(min, event.ts);
-      max = Math.max(max, event.ts + (event.dur || 0));
-    }
-
-    return { min, max };
-  }, [traceData]);
+  const addToolMessage = useCallback((content: string) => {
+    setChatMessages((previousMessages) => [
+      ...previousMessages,
+      {
+        id: createLocalId("tool"),
+        role: "tool",
+        content,
+      },
+    ]);
+  }, []);
 
   const buildRuntimeChatContext = useCallback(
     (runtime: ToolExecutionRuntime): TraceChatContext => {
-      if (!traceIndex) {
+      if (runtime.mode === "deep") {
+        const baselineView =
+          baselineTraceIndex != null
+            ? buildViewportSummary(baselineTraceIndex, {
+                viewState: runtime.baseline.viewState,
+                selectedEventId: resolveTraceEventId(
+                  baselineTraceIndex,
+                  runtime.baseline.selectedEvent
+                ),
+                searchQuery,
+              })
+            : null;
+        const candidateView =
+          candidateTraceIndex != null
+            ? buildViewportSummary(candidateTraceIndex, {
+                viewState: runtime.candidate.viewState,
+                selectedEventId: resolveTraceEventId(
+                  candidateTraceIndex,
+                  runtime.candidate.selectedEvent
+                ),
+                searchQuery,
+              })
+            : null;
+
         return {
-          currentTrace: currentTraceSnapshot,
-          previousTrace: previousTraceSnapshot,
-          currentView: null,
-          comparisonToPrevious,
+          currentTrace: candidateTraceSnapshot,
+          previousTrace: baselineTraceSnapshot,
+          currentView: candidateView,
+          comparisonToPrevious: buildTraceDiffSummary(
+            baselineTraceSnapshot,
+            candidateTraceSnapshot
+          ),
+          deepCompare: {
+            enabled: true,
+            baselineTrace: baselineTraceSnapshot,
+            candidateTrace: candidateTraceSnapshot,
+            baselineView,
+            candidateView,
+            metadata: {
+              baseline: baselineTraceSnapshot ? baselineCompareMetadata : null,
+              candidate: candidateTraceSnapshot ? candidateCompareMetadata : null,
+            },
+            normalizationMode,
+            report: deepCompareReport,
+          },
         };
       }
 
-      const selectedEventId = resolveTraceEventId(traceIndex, runtime.selectedEvent);
+      if (!singleTraceIndex) {
+        return {
+          currentTrace: singleTraceSnapshot,
+          previousTrace: previousTraceSnapshot,
+          currentView: null,
+          comparisonToPrevious,
+          deepCompare: null,
+        };
+      }
 
       return {
-        currentTrace: currentTraceSnapshot,
+        currentTrace: singleTraceSnapshot,
         previousTrace: previousTraceSnapshot,
-        currentView: buildViewportSummary(traceIndex, {
-          viewState: runtime.viewState,
-          selectedEventId,
+        currentView: buildViewportSummary(singleTraceIndex, {
+          viewState: runtime.single.viewState,
+          selectedEventId: resolveTraceEventId(singleTraceIndex, runtime.single.selectedEvent),
           searchQuery,
         }),
         comparisonToPrevious: buildTraceDiffSummary(
           previousTraceSnapshot,
-          currentTraceSnapshot
+          singleTraceSnapshot
         ),
+        deepCompare: null,
       };
     },
     [
+      baselineCompareMetadata,
+      baselineTraceIndex,
+      baselineTraceSnapshot,
+      candidateCompareMetadata,
+      candidateTraceIndex,
+      candidateTraceSnapshot,
       comparisonToPrevious,
-      currentTraceSnapshot,
+      deepCompareReport,
+      normalizationMode,
       previousTraceSnapshot,
       searchQuery,
-      traceIndex,
+      singleTraceIndex,
+      singleTraceSnapshot,
     ]
   );
 
-  const loadTraceData = useCallback(
-    (data: TraceData, name?: string) => {
-      if (currentTraceSnapshot) {
-        setPreviousTraceSnapshot(currentTraceSnapshot);
-      }
+  const handleOpenFilePicker = useCallback((target: LoadTarget) => {
+    loadTargetRef.current = target;
+    fileInputRef.current?.click();
+  }, []);
 
+  const loadTraceData = useCallback(
+    (target: LoadTarget, data: TraceData, name?: string) => {
       const loadedAt = new Date().toISOString();
-      setTraceLoadedAt(loadedAt);
-      setTraceData(data);
-      setSelectedEvent(null);
-      setFilename(name);
+      const nextViewState = buildDefaultViewState(data);
+      const label =
+        name ??
+        (target === "baseline"
+          ? "Baseline trace"
+          : target === "candidate"
+            ? "Candidate trace"
+            : "Current trace");
+
       setIsCaptureMode(false);
       setCaptureOrigin(null);
       setCaptureCurrent(null);
 
-      let min = Infinity;
-      let max = -Infinity;
+      if (target === "single") {
+        const preservedPrevious = singleTraceSnapshot ?? previousTraceSnapshot;
+        if (singleTraceSnapshot) {
+          setPreviousTraceSnapshot(singleTraceSnapshot);
+        }
 
-      for (const event of data.traceEvents) {
-        if (event.ph === "M") continue;
-        min = Math.min(min, event.ts);
-        max = Math.max(max, event.ts + (event.dur || 0));
+        setSingleTrace((previousState) => ({
+          ...previousState,
+          traceData: data,
+          traceLoadedAt: loadedAt,
+          filename: name,
+          selectedEvent: null,
+          viewState: nextViewState,
+        }));
+        setSingleTimelineApi(null);
+        addToolMessage(
+          preservedPrevious
+            ? `Loaded ${label}. Previous trace "${preservedPrevious.label}" is still available for comparison.`
+            : `Loaded ${label}.`
+        );
+        return;
       }
 
-      const padding = (max - min) * 0.05;
-      setViewState({
-        startTime: min - padding,
-        endTime: max + padding,
-        scale: 1,
-      });
+      setMode("deep");
 
-      const traceLabel = name ?? "trace";
-      setChatMessages((previousMessages) => [
-        ...previousMessages,
-        {
-          id: createLocalId("tool"),
-          role: "tool",
-          content: currentTraceSnapshot
-            ? `Loaded ${traceLabel}. Previous trace "${currentTraceSnapshot.label}" is still available for comparison.`
-            : `Loaded ${traceLabel}.`,
-        },
-      ]);
+      if (target === "baseline") {
+        setBaselineTrace((previousState) => ({
+          ...previousState,
+          traceData: data,
+          traceLoadedAt: loadedAt,
+          filename: name,
+          selectedEvent: null,
+          viewState: nextViewState,
+        }));
+        setBaselineTimelineApi(null);
+        setBaselineMetadata((previousMetadata) => ({
+          ...previousMetadata,
+          traceId: `${loadedAt}:${label}`,
+          label,
+        }));
+        addToolMessage(`Loaded ${label} as the Deep Mode baseline.`);
+        return;
+      }
+
+      setCandidateTrace((previousState) => ({
+        ...previousState,
+        traceData: data,
+        traceLoadedAt: loadedAt,
+        filename: name,
+        selectedEvent: null,
+        viewState: nextViewState,
+      }));
+      setCandidateTimelineApi(null);
+      setCandidateMetadata((previousMetadata) => ({
+        ...previousMetadata,
+        traceId: `${loadedAt}:${label}`,
+        label,
+      }));
+      addToolMessage(`Loaded ${label} as the Deep Mode candidate.`);
     },
-    [currentTraceSnapshot]
+    [addToolMessage, previousTraceSnapshot, singleTraceSnapshot]
   );
 
-  const handleLoadFile = useCallback(() => {
-    fileInputRef.current?.click();
-  }, []);
-
   const handleFileChange = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
       if (!file) return;
 
+      const target = loadTargetRef.current;
       const reader = new FileReader();
-      reader.onload = (event) => {
+
+      reader.onload = (loadEvent) => {
         try {
-          const content = event.target?.result as string;
+          const content = loadEvent.target?.result as string;
           const data = JSON.parse(content) as TraceData;
 
           if (Array.isArray(data)) {
-            loadTraceData({ traceEvents: data }, file.name);
+            loadTraceData(target, { traceEvents: data }, file.name);
           } else if (data.traceEvents) {
-            loadTraceData(data, file.name);
+            loadTraceData(target, data, file.name);
           } else {
             alert("Invalid trace format. Expected Chrome trace JSON format.");
           }
@@ -520,9 +869,9 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
           alert("Failed to parse trace file. Make sure it's valid JSON.");
         }
       };
-      reader.readAsText(file);
 
-      e.target.value = "";
+      reader.readAsText(file);
+      event.target.value = "";
     },
     [loadTraceData]
   );
@@ -592,25 +941,36 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
 
       const createdAt = new Date().toISOString();
       setPendingAttachments((previousAttachments) => {
-        const nextAttachment: TraceChatAttachment = {
-          id: createLocalId("image"),
-          kind: "image",
-          source: "manual_capture",
-          label: `Trace capture ${previousAttachments.filter((item) => item.kind === "image").length + 1}`,
-          createdAt,
-          traceId: currentTraceSnapshot?.id ?? null,
-          traceLabel: currentTraceSnapshot?.label ?? null,
-          imageDataUrl: croppedCanvas.toDataURL("image/png"),
-          mimeType: "image/png",
-          width: sourceWidth,
-          height: sourceHeight,
-        };
+        const imageCount = previousAttachments.filter(
+          (attachment) => attachment.kind === "image"
+        ).length;
 
-        return [...previousAttachments, nextAttachment];
+        return [
+          ...previousAttachments,
+          {
+            id: createLocalId("image"),
+            kind: "image",
+            source: "manual_capture",
+            label: `Trace capture ${imageCount + 1}`,
+            createdAt,
+            traceId:
+              mode === "deep"
+                ? candidateTraceSnapshot?.id ?? baselineTraceSnapshot?.id ?? null
+                : singleTraceSnapshot?.id ?? null,
+            traceLabel:
+              mode === "deep"
+                ? candidateTraceSnapshot?.label ?? baselineTraceSnapshot?.label ?? null
+                : singleTraceSnapshot?.label ?? null,
+            imageDataUrl: croppedCanvas.toDataURL("image/png"),
+            mimeType: "image/png",
+            width: sourceWidth,
+            height: sourceHeight,
+          },
+        ];
       });
       setChatErrorMessage(null);
     },
-    [currentTraceSnapshot]
+    [baselineTraceSnapshot, candidateTraceSnapshot, mode, singleTraceSnapshot]
   );
 
   const handleStartAreaCapture = useCallback(() => {
@@ -679,131 +1039,392 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
     );
   }, []);
 
-  const handleAttachSelectionToChat = useCallback(() => {
-    if (!selectedEvent || !traceIndex || !currentTraceSnapshot) {
-      setChatErrorMessage("Select a span before attaching it to chat.");
-      return;
-    }
+  const attachSelectionFromTarget = useCallback(
+    (target: RuntimeTargetKey) => {
+      const traceIndex =
+        target === "single"
+          ? singleTraceIndex
+          : target === "baseline"
+            ? baselineTraceIndex
+            : candidateTraceIndex;
+      const selectedEvent =
+        target === "single"
+          ? singleTrace.selectedEvent
+          : target === "baseline"
+            ? baselineTrace.selectedEvent
+            : candidateTrace.selectedEvent;
+      const snapshot =
+        target === "single"
+          ? singleTraceSnapshot
+          : target === "baseline"
+            ? baselineTraceSnapshot
+            : candidateTraceSnapshot;
 
-    const eventId = resolveTraceEventId(traceIndex, selectedEvent);
-    if (!eventId) {
-      setChatErrorMessage("The selected span is no longer available.");
-      return;
-    }
-
-    const inspection = inspectTraceEvent(traceIndex, eventId);
-    if (!inspection) {
-      setChatErrorMessage("The selected span could not be inspected.");
-      return;
-    }
-
-    const nextAttachment: TraceChatSelectionAttachment = {
-      id: createLocalId("selection"),
-      kind: "selection",
-      source: "selection_details",
-      label: inspection.event.name,
-      createdAt: new Date().toISOString(),
-      traceId: currentTraceSnapshot.id,
-      traceLabel: currentTraceSnapshot.label,
-      fingerprint: [
-        currentTraceSnapshot.id,
-        eventId,
-        inspection.event.ts,
-        inspection.event.dur,
-        inspection.event.pid,
-        inspection.event.tid,
-      ].join(":"),
-      trace: buildAttachedTraceSummary(currentTraceSnapshot),
-      event: inspection.event,
-      inspection,
-      rawEvent: JSON.parse(JSON.stringify(selectedEvent)) as TraceEvent,
-    };
-
-    setPendingAttachments((previousAttachments) => [
-      ...previousAttachments,
-      nextAttachment,
-    ]);
-    setChatErrorMessage(null);
-  }, [currentTraceSnapshot, selectedEvent, traceIndex]);
-
-  const handleZoomIn = useCallback(() => {
-    const center = (viewState.startTime + viewState.endTime) / 2;
-    const duration = viewState.endTime - viewState.startTime;
-    const newDuration = duration / 1.5;
-    setViewState({
-      ...viewState,
-      startTime: center - newDuration / 2,
-      endTime: center + newDuration / 2,
-    });
-  }, [viewState]);
-
-  const handleZoomOut = useCallback(() => {
-    const center = (viewState.startTime + viewState.endTime) / 2;
-    const duration = viewState.endTime - viewState.startTime;
-    const newDuration = duration * 1.5;
-    setViewState({
-      ...viewState,
-      startTime: center - newDuration / 2,
-      endTime: center + newDuration / 2,
-    });
-  }, [viewState]);
-
-  const handleResetView = useCallback(() => {
-    const padding = (timeBounds.max - timeBounds.min) * 0.05;
-    setViewState({
-      startTime: timeBounds.min - padding,
-      endTime: timeBounds.max + padding,
-      scale: 1,
-    });
-  }, [timeBounds]);
-
-  const handleFitToWindow = useCallback(() => {
-    const padding = (timeBounds.max - timeBounds.min) * 0.02;
-    setViewState({
-      startTime: timeBounds.min - padding,
-      endTime: timeBounds.max + padding,
-      scale: 1,
-    });
-  }, [timeBounds]);
-
-  const handlePanLeft = useCallback(() => {
-    const duration = viewState.endTime - viewState.startTime;
-    const panAmount = duration * 0.2;
-    setViewState({
-      ...viewState,
-      startTime: viewState.startTime - panAmount,
-      endTime: viewState.endTime - panAmount,
-    });
-  }, [viewState]);
-
-  const handlePanRight = useCallback(() => {
-    const duration = viewState.endTime - viewState.startTime;
-    const panAmount = duration * 0.2;
-    setViewState({
-      ...viewState,
-      startTime: viewState.startTime + panAmount,
-      endTime: viewState.endTime + panAmount,
-    });
-  }, [viewState]);
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+      if (!selectedEvent || !traceIndex || !snapshot) {
+        setChatErrorMessage("Select a span before attaching it to chat.");
         return;
       }
 
-       if (isCaptureMode && e.key === "Escape") {
-        e.preventDefault();
+      const eventId = resolveTraceEventId(traceIndex, selectedEvent);
+      if (!eventId) {
+        setChatErrorMessage("The selected span is no longer available.");
+        return;
+      }
+
+      const inspection = inspectTraceEvent(traceIndex, eventId);
+      if (!inspection) {
+        setChatErrorMessage("The selected span could not be inspected.");
+        return;
+      }
+
+      const nextAttachment: TraceChatSelectionAttachment = {
+        id: createLocalId("selection"),
+        kind: "selection",
+        source: "selection_details",
+        label: inspection.event.name,
+        createdAt: new Date().toISOString(),
+        traceId: snapshot.id,
+        traceLabel: snapshot.label,
+        fingerprint: [
+          snapshot.id,
+          eventId,
+          inspection.event.ts,
+          inspection.event.dur,
+          inspection.event.pid,
+          inspection.event.tid,
+        ].join(":"),
+        trace: buildAttachedTraceSummary(snapshot),
+        event: inspection.event,
+        inspection,
+        rawEvent: JSON.parse(JSON.stringify(selectedEvent)) as TraceEvent,
+      };
+
+      setPendingAttachments((previousAttachments) => [
+        ...previousAttachments,
+        nextAttachment,
+      ]);
+      setChatErrorMessage(null);
+    },
+    [
+      baselineTrace.selectedEvent,
+      baselineTraceIndex,
+      baselineTraceSnapshot,
+      candidateTrace.selectedEvent,
+      candidateTraceIndex,
+      candidateTraceSnapshot,
+      singleTrace.selectedEvent,
+      singleTraceIndex,
+      singleTraceSnapshot,
+    ]
+  );
+
+  const focusLiveCompareRegion = useCallback(
+    (traceRole: TraceRole, startTime: number, endTime: number, eventIds: string[]) => {
+      const duration = Math.max(endTime - startTime, 1_000);
+      const padding = Math.max(duration * 0.25, 10_000);
+      const nextViewState = {
+        startTime: startTime - padding,
+        endTime: endTime + padding,
+        scale: 1,
+      };
+
+      if (traceRole === "baseline") {
+        const event = eventIds[0]
+          ? baselineTraceIndex?.eventById.get(eventIds[0])?.event ?? null
+          : null;
+        setBaselineTrace((previousState) => ({
+          ...previousState,
+          selectedEvent: event,
+          viewState: nextViewState,
+        }));
+        return;
+      }
+
+      const event = eventIds[0]
+        ? candidateTraceIndex?.eventById.get(eventIds[0])?.event ?? null
+        : null;
+      setCandidateTrace((previousState) => ({
+        ...previousState,
+        selectedEvent: event,
+        viewState: nextViewState,
+      }));
+    },
+    [baselineTraceIndex, candidateTraceIndex]
+  );
+
+  const handleFocusCompareFinding = useCallback(
+    (findingId: string) => {
+      const finding = findCompareFinding(deepCompareReport, findingId);
+      if (!finding) return;
+
+      const seenRoles = new Set<TraceRole>();
+      for (const region of finding.evidence) {
+        if (seenRoles.has(region.traceRole)) continue;
+        seenRoles.add(region.traceRole);
+        focusLiveCompareRegion(
+          region.traceRole,
+          region.startTime,
+          region.endTime,
+          region.eventIds
+        );
+      }
+    },
+    [deepCompareReport, focusLiveCompareRegion]
+  );
+
+  const handleZoomIn = useCallback(() => {
+    setSingleTrace((previousState) => ({
+      ...previousState,
+      viewState: zoomViewState(previousState.viewState, 1 / 1.5),
+    }));
+  }, []);
+
+  const handleZoomOut = useCallback(() => {
+    setSingleTrace((previousState) => ({
+      ...previousState,
+      viewState: zoomViewState(previousState.viewState, 1.5),
+    }));
+  }, []);
+
+  const handleResetView = useCallback(() => {
+    setSingleTrace((previousState) => ({
+      ...previousState,
+      viewState: fitViewStateToBounds(singleTimeBounds, 0.05),
+    }));
+  }, [singleTimeBounds]);
+
+  const handleFitToWindow = useCallback(() => {
+    setSingleTrace((previousState) => ({
+      ...previousState,
+      viewState: fitViewStateToBounds(singleTimeBounds, 0.02),
+    }));
+  }, [singleTimeBounds]);
+
+  const handlePanLeft = useCallback(() => {
+    const setter = mode === "deep" ? setCandidateTrace : setSingleTrace;
+    setter((previousState) => ({
+      ...previousState,
+      viewState: panViewState(previousState.viewState, -0.2),
+    }));
+  }, [mode]);
+
+  const handlePanRight = useCallback(() => {
+    const setter = mode === "deep" ? setCandidateTrace : setSingleTrace;
+    setter((previousState) => ({
+      ...previousState,
+      viewState: panViewState(previousState.viewState, 0.2),
+    }));
+  }, [mode]);
+
+  const handleSelectTool = useCallback(() => {
+    if (mode === "deep") {
+      setCandidateTrace((previousState) => ({
+        ...previousState,
+        tool: "select",
+      }));
+      return;
+    }
+
+    setSingleTrace((previousState) => ({
+      ...previousState,
+      tool: "select",
+    }));
+  }, [mode]);
+
+  const handlePanTool = useCallback(() => {
+    if (mode === "deep") {
+      setCandidateTrace((previousState) => ({
+        ...previousState,
+        tool: "pan",
+      }));
+      return;
+    }
+
+    setSingleTrace((previousState) => ({
+      ...previousState,
+      tool: "pan",
+    }));
+  }, [mode]);
+
+  const handleClearSelection = useCallback(() => {
+    if (mode === "deep") {
+      setBaselineTrace((previousState) => ({
+        ...previousState,
+        selectedEvent: null,
+      }));
+      setCandidateTrace((previousState) => ({
+        ...previousState,
+        selectedEvent: null,
+      }));
+      return;
+    }
+
+    setSingleTrace((previousState) => ({
+      ...previousState,
+      selectedEvent: null,
+    }));
+  }, [mode]);
+
+  const handleOpenCommandPalette = useCallback(() => {
+    setIsCommandPaletteOpen(true);
+  }, []);
+
+  const captureCurrentScreenshot = useCallback(async (): Promise<string | null> => {
+    if (mode === "single") {
+      return singleTimelineApi?.captureImage() ?? null;
+    }
+
+    if (!workspaceRef.current) return null;
+
+    const canvas = await toCanvas(workspaceRef.current, {
+      cacheBust: true,
+      backgroundColor: "#ffffff",
+      pixelRatio: Math.min(window.devicePixelRatio || 1, 2),
+    });
+
+    return canvas.toDataURL("image/png");
+  }, [mode, singleTimelineApi]);
+
+  const handleExportCompareReport = useCallback(() => {
+    if (!deepCompareReport) return;
+
+    const blob = new Blob([buildTraceCompareReportExport(deepCompareReport)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${
+      baselineTrace.filename ?? baselineCompareMetadata.label
+    }-vs-${candidateTrace.filename ?? candidateCompareMetadata.label}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }, [
+    baselineCompareMetadata.label,
+    baselineTrace.filename,
+    candidateCompareMetadata.label,
+    candidateTrace.filename,
+    deepCompareReport,
+  ]);
+
+  const handleClearHistory = useCallback(() => {
+    setChatMessages([]);
+    setChatErrorMessage(null);
+    setChatResponseId(null);
+    setPendingAttachments([]);
+    setAttachedRepos([]);
+    setPreviousTraceSnapshot(null);
+
+    if (typeof window !== "undefined") {
+      localStorage.removeItem(TRACE_AGENT_CHAT_STORAGE_KEY);
+      localStorage.removeItem(TRACE_AGENT_TRACE_STORAGE_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || hasRestoredPersistentChatRef.current) return;
+    hasRestoredPersistentChatRef.current = true;
+
+    try {
+      const rawSession = localStorage.getItem(TRACE_AGENT_CHAT_STORAGE_KEY);
+      if (rawSession) {
+        const parsed = JSON.parse(rawSession) as PersistedChatSession;
+        if (Array.isArray(parsed.messages)) {
+          setChatMessages(parsed.messages);
+        }
+        if (typeof parsed.responseId === "string" || parsed.responseId === null) {
+          setChatResponseId(parsed.responseId);
+        }
+        if (Array.isArray(parsed.repoMentions)) {
+          setAttachedRepos(parsed.repoMentions);
+        }
+      }
+    } catch {
+      // Ignore malformed persisted chat state.
+    }
+
+    try {
+      const rawTraceSnapshot = localStorage.getItem(TRACE_AGENT_TRACE_STORAGE_KEY);
+      if (rawTraceSnapshot) {
+        setPreviousTraceSnapshot(JSON.parse(rawTraceSnapshot) as TraceSnapshot);
+      }
+    } catch {
+      // Ignore malformed persisted trace state.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !hasRestoredPersistentChatRef.current) return;
+
+    if (chatMessages.length === 0 && !chatResponseId) {
+      localStorage.removeItem(TRACE_AGENT_CHAT_STORAGE_KEY);
+      return;
+    }
+
+    const session: PersistedChatSession = {
+      messages: chatMessages.map(sanitizeMessageForPersistence),
+      responseId: chatResponseId,
+      repoMentions: attachedRepos,
+    };
+
+    localStorage.setItem(TRACE_AGENT_CHAT_STORAGE_KEY, JSON.stringify(session));
+  }, [attachedRepos, chatMessages, chatResponseId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !hasRestoredPersistentChatRef.current) return;
+
+    if (!singleTraceSnapshot) return;
+    localStorage.setItem(TRACE_AGENT_TRACE_STORAGE_KEY, JSON.stringify(singleTraceSnapshot));
+  }, [singleTraceSnapshot]);
+
+  useEffect(() => {
+    const handleCommandPaletteShortcut = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setIsCommandPaletteOpen((previousOpen) => !previousOpen);
+      }
+    };
+
+    window.addEventListener("keydown", handleCommandPaletteShortcut);
+    return () => window.removeEventListener("keydown", handleCommandPaletteShortcut);
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+
+      if (isCommandPaletteOpen) {
+        return;
+      }
+
+      if (isCaptureMode && event.key === "Escape") {
+        event.preventDefault();
         cancelAreaCapture();
         return;
       }
 
-      switch (e.key.toLowerCase()) {
+      switch (event.key.toLowerCase()) {
         case "w":
-          handleZoomIn();
+          if (mode === "deep") {
+            setCandidateTrace((previousState) => ({
+              ...previousState,
+              viewState: zoomViewState(previousState.viewState, 1 / 1.5),
+            }));
+          } else {
+            handleZoomIn();
+          }
           break;
         case "s":
-          handleZoomOut();
+          if (mode === "deep") {
+            setCandidateTrace((previousState) => ({
+              ...previousState,
+              viewState: zoomViewState(previousState.viewState, 1.5),
+            }));
+          } else {
+            handleZoomOut();
+          }
           break;
         case "a":
           handlePanLeft();
@@ -812,16 +1433,23 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
           handlePanRight();
           break;
         case "1":
-          setTool("select");
+          handleSelectTool();
           break;
         case "2":
-          setTool("pan");
+          handlePanTool();
           break;
         case "0":
-          handleFitToWindow();
+          if (mode === "deep") {
+            setCandidateTrace((previousState) => ({
+              ...previousState,
+              viewState: fitViewStateToBounds(candidateTimeBounds, 0.02),
+            }));
+          } else {
+            handleFitToWindow();
+          }
           break;
         case "escape":
-          setSelectedEvent(null);
+          handleClearSelection();
           break;
       }
     };
@@ -830,13 +1458,54 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
     cancelAreaCapture,
+    candidateTimeBounds,
     handleFitToWindow,
     handlePanLeft,
     handlePanRight,
+    handlePanTool,
+    handleSelectTool,
     handleZoomIn,
     handleZoomOut,
+    handleClearSelection,
+    isCommandPaletteOpen,
     isCaptureMode,
+    mode,
   ]);
+
+  const requestRepoContext = useCallback(
+    async (payload: {
+      action: "snapshot" | "search_paths" | "list_directory" | "read_file";
+      repo: GitHubRepoMention;
+      query?: string;
+      path?: string;
+      limit?: number;
+    }) => {
+      const response = await fetch("/api/repo-context", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        const responseText = await response.text();
+        let errorMessage = responseText;
+
+        try {
+          const errorJson = JSON.parse(responseText) as { error?: string };
+          errorMessage = errorJson.error ?? responseText;
+        } catch {
+          errorMessage = responseText;
+        }
+
+        throw new Error(errorMessage || "GitHub repo request failed.");
+      }
+
+      return (await response.json()) as unknown;
+    },
+    []
+  );
 
   const requestTraceChat = useCallback(
     async (
@@ -888,25 +1557,25 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
       const processLine = (line: string) => {
         if (!line.trim()) return;
 
-        let event: TraceChatStreamEvent;
+        let parsedEvent: TraceChatStreamEvent;
         try {
-          event = JSON.parse(line) as TraceChatStreamEvent;
+          parsedEvent = JSON.parse(line) as TraceChatStreamEvent;
         } catch {
           return;
         }
 
-        if (event.type === "assistant_delta") {
-          onAssistantDelta(event.delta);
+        if (parsedEvent.type === "assistant_delta") {
+          onAssistantDelta(parsedEvent.delta);
           return;
         }
 
-        if (event.type === "assistant_done") {
-          finalResponse = event.response;
+        if (parsedEvent.type === "assistant_done") {
+          finalResponse = parsedEvent.response;
           return;
         }
 
-        if (event.type === "error") {
-          throw new Error(event.error);
+        if (parsedEvent.type === "error") {
+          throw new Error(parsedEvent.error);
         }
       };
 
@@ -945,34 +1614,166 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
       runtime: ToolExecutionRuntime
     ): Promise<ToolExecutionResult> => {
       const nextRuntime: ToolExecutionRuntime = {
-        viewState: runtime.viewState,
-        selectedEvent: runtime.selectedEvent,
+        mode: runtime.mode,
+        single: {
+          ...runtime.single,
+        },
+        baseline: {
+          ...runtime.baseline,
+        },
+        candidate: {
+          ...runtime.candidate,
+        },
       };
 
-      if (!traceIndex || !currentTraceSnapshot) {
+      const getTargetByKey = (targetKey: RuntimeTargetKey) => {
+        if (targetKey === "single") {
+          return {
+            targetKey,
+            label: "current trace",
+            traceIndex: singleTraceIndex,
+            traceSnapshot: singleTraceSnapshot,
+            runtimeState: nextRuntime.single,
+            setSelectedEvent: (event: TraceEvent | null) =>
+              setSingleTrace((previousState) => ({
+                ...previousState,
+                selectedEvent: event,
+              })),
+            setViewState: (viewState: ViewState) =>
+              setSingleTrace((previousState) => ({
+                ...previousState,
+                viewState,
+              })),
+          };
+        }
+
+        if (targetKey === "baseline") {
+          return {
+            targetKey,
+            label: "baseline trace",
+            traceIndex: baselineTraceIndex,
+            traceSnapshot: baselineTraceSnapshot,
+            runtimeState: nextRuntime.baseline,
+            setSelectedEvent: (event: TraceEvent | null) =>
+              setBaselineTrace((previousState) => ({
+                ...previousState,
+                selectedEvent: event,
+              })),
+            setViewState: (viewState: ViewState) =>
+              setBaselineTrace((previousState) => ({
+                ...previousState,
+                viewState,
+              })),
+          };
+        }
+
         return {
-          runtime: nextRuntime,
-          logMessage: "Assistant requested a trace inspection before any trace was loaded.",
-          output: {
-            success: false,
-            error: "No trace is currently loaded.",
-          },
+          targetKey,
+          label: "candidate trace",
+          traceIndex: candidateTraceIndex,
+          traceSnapshot: candidateTraceSnapshot,
+          runtimeState: nextRuntime.candidate,
+          setSelectedEvent: (event: TraceEvent | null) =>
+            setCandidateTrace((previousState) => ({
+              ...previousState,
+              selectedEvent: event,
+            })),
+          setViewState: (viewState: ViewState) =>
+            setCandidateTrace((previousState) => ({
+              ...previousState,
+              viewState,
+            })),
         };
-      }
+      };
+
+      const getTarget = (requestedRole: unknown) => {
+        const targetKey: RuntimeTargetKey =
+          nextRuntime.mode === "deep"
+            ? isTraceRole(requestedRole)
+              ? requestedRole
+              : "candidate"
+            : "single";
+
+        return getTargetByKey(targetKey);
+      };
+
+      const buildTargetViewSummary = (targetKey: RuntimeTargetKey) => {
+        const target = getTargetByKey(targetKey);
+        if (!target.traceIndex) return null;
+
+        return buildViewportSummary(target.traceIndex, {
+          viewState: target.runtimeState.viewState,
+          selectedEventId: resolveTraceEventId(
+            target.traceIndex,
+            target.runtimeState.selectedEvent
+          ),
+          searchQuery,
+        });
+      };
+
+      const focusRegionOnTarget = (targetKey: RuntimeTargetKey, region: {
+        startTime: number;
+        endTime: number;
+        eventIds: string[];
+      }, paddingRatio: number) => {
+        const target = getTargetByKey(targetKey);
+        if (!target.traceIndex || !target.traceSnapshot) return false;
+
+        const duration = Math.max(region.endTime - region.startTime, 1_000);
+        const padding = Math.max(duration * paddingRatio, 10_000);
+        const nextViewState = {
+          startTime: region.startTime - padding,
+          endTime: region.endTime + padding,
+          scale: 1,
+        };
+        const nextSelectedEvent = region.eventIds[0]
+          ? target.traceIndex.eventById.get(region.eventIds[0])?.event ?? null
+          : null;
+
+        target.runtimeState.viewState = nextViewState;
+        target.runtimeState.selectedEvent = nextSelectedEvent;
+        target.setViewState(nextViewState);
+        target.setSelectedEvent(nextSelectedEvent);
+
+        return true;
+      };
+
+      const getRepoMention = (repoId: unknown) => {
+        if (typeof repoId !== "string" || !repoId.trim()) return null;
+        return attachedRepos.find((repo) => repo.id === repoId) ?? null;
+      };
 
       switch (toolCall.name) {
         case "search_events": {
+          const target = getTarget(toolCall.arguments.trace_role);
+          if (!target.traceIndex) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant requested a trace search before any trace was loaded.",
+              output: {
+                success: false,
+                error: `No ${target.label} is currently loaded.`,
+              },
+            };
+          }
+
           const query =
             typeof toolCall.arguments.query === "string" ? toolCall.arguments.query : "";
           const limit = clampNumber(toolCall.arguments.limit, 1, 12, 6);
-          const matches = searchTraceEvents(traceIndex, query, limit, nextRuntime.viewState);
+          const matches = searchTraceEvents(
+            target.traceIndex,
+            query,
+            limit,
+            target.runtimeState.viewState
+          );
 
           return {
             runtime: nextRuntime,
             logMessage: matches.length
-              ? `Assistant searched for "${query}" and found ${matches.length} matching spans.`
-              : `Assistant searched for "${query}" but found no matching spans.`,
+              ? `Assistant searched the ${target.label} for "${query}" and found ${matches.length} matching spans.`
+              : `Assistant searched the ${target.label} for "${query}" but found no matching spans.`,
             output: {
+              traceRole: target.targetKey,
               query,
               matchCount: matches.length,
               matches,
@@ -981,41 +1782,65 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
         }
 
         case "inspect_event": {
+          const target = getTarget(toolCall.arguments.trace_role);
+          if (!target.traceIndex) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant requested an event inspection before any trace was loaded.",
+              output: {
+                success: false,
+                error: `No ${target.label} is currently loaded.`,
+              },
+            };
+          }
+
           const eventId =
             typeof toolCall.arguments.event_id === "string"
               ? toolCall.arguments.event_id
               : "";
-          const inspection = inspectTraceEvent(traceIndex, eventId);
+          const inspection = inspectTraceEvent(target.traceIndex, eventId);
 
           return {
             runtime: nextRuntime,
             logMessage: inspection
-              ? `Assistant inspected ${inspection.event.name} on ${inspection.event.threadName}.`
-              : "Assistant tried to inspect an event that is no longer available.",
+              ? `Assistant inspected ${inspection.event.name} on the ${target.label}.`
+              : `Assistant tried to inspect an event that is no longer available in the ${target.label}.`,
             output:
               inspection ?? {
                 success: false,
-                error: `Event "${eventId}" was not found in the current trace.`,
+                error: `Event "${eventId}" was not found in the ${target.label}.`,
               },
           };
         }
 
         case "inspect_current_view": {
+          const target = getTarget(toolCall.arguments.trace_role);
+          if (!target.traceIndex) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant requested a viewport inspection before any trace was loaded.",
+              output: {
+                success: false,
+                error: `No ${target.label} is currently loaded.`,
+              },
+            };
+          }
+
           const limit = clampNumber(toolCall.arguments.limit, 1, 12, 6);
-          const selectedEventId = resolveTraceEventId(
-            traceIndex,
-            nextRuntime.selectedEvent
-          );
-          const viewSummary = buildViewportSummary(traceIndex, {
-            viewState: nextRuntime.viewState,
-            selectedEventId,
+          const viewSummary = buildViewportSummary(target.traceIndex, {
+            viewState: target.runtimeState.viewState,
+            selectedEventId: resolveTraceEventId(
+              target.traceIndex,
+              target.runtimeState.selectedEvent
+            ),
             searchQuery,
           });
 
           return {
             runtime: nextRuntime,
-            logMessage: "Assistant inspected the current viewport.",
+            logMessage: `Assistant inspected the ${target.label} viewport.`,
             output: {
+              traceRole: target.targetKey,
               ...viewSummary,
               topVisibleHotspots: viewSummary.topVisibleHotspots.slice(0, limit),
               topVisibleSpikeHotspots: viewSummary.topVisibleSpikeHotspots.slice(0, limit),
@@ -1028,194 +1853,544 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
         }
 
         case "focus_event": {
+          const target = getTarget(toolCall.arguments.trace_role);
+          if (!target.traceIndex) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant requested a focus action before any trace was loaded.",
+              output: {
+                success: false,
+                error: `No ${target.label} is currently loaded.`,
+              },
+            };
+          }
+
           const eventId =
             typeof toolCall.arguments.event_id === "string"
               ? toolCall.arguments.event_id
               : "";
           const paddingRatio = clampNumber(toolCall.arguments.padding_ratio, 0, 2, 0.35);
-          const targetEvent = traceIndex.eventById.get(eventId);
+          const targetEvent = target.traceIndex.eventById.get(eventId);
 
           if (!targetEvent) {
             return {
               runtime: nextRuntime,
-              logMessage: "Assistant tried to focus an event that is no longer available.",
+              logMessage: `Assistant tried to focus an event that is no longer available in the ${target.label}.`,
               output: {
                 success: false,
-                error: `Event "${eventId}" was not found in the current trace.`,
+                error: `Event "${eventId}" was not found in the ${target.label}.`,
               },
             };
           }
 
-          const baseDuration = Math.max(targetEvent.dur, 25000);
-          const padding = Math.max(baseDuration * paddingRatio, 10000);
-          nextRuntime.viewState = {
+          const baseDuration = Math.max(targetEvent.dur, 25_000);
+          const padding = Math.max(baseDuration * paddingRatio, 10_000);
+          const nextViewState = {
             startTime: targetEvent.ts - padding,
             endTime: targetEvent.endTime + padding,
             scale: 1,
           };
-          nextRuntime.selectedEvent = targetEvent.event;
 
-          setSelectedEvent(targetEvent.event);
-          setViewState(nextRuntime.viewState);
+          target.runtimeState.viewState = nextViewState;
+          target.runtimeState.selectedEvent = targetEvent.event;
+          target.setSelectedEvent(targetEvent.event);
+          target.setViewState(nextViewState);
+
           await waitForFrames();
-
-          const inspection = inspectTraceEvent(traceIndex, eventId);
-          const selectedEventId = resolveTraceEventId(
-            traceIndex,
-            nextRuntime.selectedEvent
-          );
-          const viewSummary = buildViewportSummary(traceIndex, {
-            viewState: nextRuntime.viewState,
-            selectedEventId,
-            searchQuery,
-          });
 
           return {
             runtime: nextRuntime,
-            logMessage: `Assistant focused ${targetEvent.name} on ${targetEvent.threadName}.`,
+            logMessage: `Assistant focused ${targetEvent.name} on the ${target.label}.`,
             output: {
               success: true,
-              focusedEvent: inspection?.event ?? null,
-              currentView: viewSummary,
+              traceRole: target.targetKey,
+              focusedEvent: inspectTraceEvent(target.traceIndex, eventId)?.event ?? null,
+              currentView: buildTargetViewSummary(target.targetKey),
             },
           };
         }
 
         case "set_view_range": {
+          const target = getTarget(toolCall.arguments.trace_role);
+          if (!target.traceIndex) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant requested a zoom action before any trace was loaded.",
+              output: {
+                success: false,
+                error: `No ${target.label} is currently loaded.`,
+              },
+            };
+          }
+
           const startTimeUs = clampNumber(
             toolCall.arguments.start_time_us,
             -Number.MAX_SAFE_INTEGER,
             Number.MAX_SAFE_INTEGER,
-            nextRuntime.viewState.startTime
+            target.runtimeState.viewState.startTime
           );
           const endTimeUs = clampNumber(
             toolCall.arguments.end_time_us,
             -Number.MAX_SAFE_INTEGER,
             Number.MAX_SAFE_INTEGER,
-            nextRuntime.viewState.endTime
+            target.runtimeState.viewState.endTime
           );
-          const minSpan = 1000;
-          const startTime = Math.min(startTimeUs, endTimeUs - minSpan);
-          const endTime = Math.max(endTimeUs, startTimeUs + minSpan);
-          nextRuntime.viewState = {
-            startTime,
-            endTime,
+          const minSpan = 1_000;
+          const nextViewState = {
+            startTime: Math.min(startTimeUs, endTimeUs - minSpan),
+            endTime: Math.max(endTimeUs, startTimeUs + minSpan),
             scale: 1,
           };
 
-          setViewState(nextRuntime.viewState);
+          target.runtimeState.viewState = nextViewState;
+          target.setViewState(nextViewState);
           await waitForFrames();
-
-          const selectedEventId = resolveTraceEventId(
-            traceIndex,
-            nextRuntime.selectedEvent
-          );
-          const viewSummary = buildViewportSummary(traceIndex, {
-            viewState: nextRuntime.viewState,
-            selectedEventId,
-            searchQuery,
-          });
 
           return {
             runtime: nextRuntime,
-            logMessage: `Assistant zoomed to a ${formatTimeShort(
-              endTime - startTime
+            logMessage: `Assistant zoomed the ${target.label} to a ${formatTimeShort(
+              nextViewState.endTime - nextViewState.startTime
             )} window.`,
             output: {
               success: true,
-              currentView: viewSummary,
+              traceRole: target.targetKey,
+              currentView: buildTargetViewSummary(target.targetKey),
             },
           };
         }
 
         case "fit_to_trace": {
+          const target = getTarget(toolCall.arguments.trace_role);
+          if (!target.traceSnapshot) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant requested a fit action before any trace was loaded.",
+              output: {
+                success: false,
+                error: `No ${target.label} is currently loaded.`,
+              },
+            };
+          }
+
           const includePadding = Boolean(toolCall.arguments.include_padding);
-          const padding = includePadding ? currentTraceSnapshot.bounds.duration * 0.02 : 0;
-          nextRuntime.viewState = {
-            startTime: currentTraceSnapshot.bounds.startTime - padding,
-            endTime: currentTraceSnapshot.bounds.endTime + padding,
+          const padding = includePadding ? target.traceSnapshot.bounds.duration * 0.02 : 0;
+          const nextViewState = {
+            startTime: target.traceSnapshot.bounds.startTime - padding,
+            endTime: target.traceSnapshot.bounds.endTime + padding,
             scale: 1,
           };
 
-          setViewState(nextRuntime.viewState);
+          target.runtimeState.viewState = nextViewState;
+          target.setViewState(nextViewState);
           await waitForFrames();
-
-          const selectedEventId = resolveTraceEventId(
-            traceIndex,
-            nextRuntime.selectedEvent
-          );
-          const viewSummary = buildViewportSummary(traceIndex, {
-            viewState: nextRuntime.viewState,
-            selectedEventId,
-            searchQuery,
-          });
 
           return {
             runtime: nextRuntime,
-            logMessage: "Assistant reset the viewport to the full trace.",
+            logMessage: `Assistant reset the ${target.label} viewport to the full trace.`,
             output: {
               success: true,
-              currentView: viewSummary,
+              traceRole: target.targetKey,
+              currentView: buildTargetViewSummary(target.targetKey),
             },
           };
         }
 
         case "clear_selection": {
+          const target = getTarget(toolCall.arguments.trace_role);
+          if (!target.traceSnapshot) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant requested a clear action before any trace was loaded.",
+              output: {
+                success: false,
+                error: `No ${target.label} is currently loaded.`,
+              },
+            };
+          }
+
           const keepView = Boolean(toolCall.arguments.keep_view);
-          nextRuntime.selectedEvent = null;
-          setSelectedEvent(null);
+          target.runtimeState.selectedEvent = null;
+          target.setSelectedEvent(null);
 
           if (!keepView) {
-            const padding = currentTraceSnapshot.bounds.duration * 0.02;
-            nextRuntime.viewState = {
-              startTime: currentTraceSnapshot.bounds.startTime - padding,
-              endTime: currentTraceSnapshot.bounds.endTime + padding,
+            const padding = target.traceSnapshot.bounds.duration * 0.02;
+            const nextViewState = {
+              startTime: target.traceSnapshot.bounds.startTime - padding,
+              endTime: target.traceSnapshot.bounds.endTime + padding,
               scale: 1,
             };
-            setViewState(nextRuntime.viewState);
+            target.runtimeState.viewState = nextViewState;
+            target.setViewState(nextViewState);
           }
 
           await waitForFrames();
 
-          const viewSummary = buildViewportSummary(traceIndex, {
-            viewState: nextRuntime.viewState,
-            selectedEventId: null,
-            searchQuery,
-          });
-
           return {
             runtime: nextRuntime,
-            logMessage: "Assistant cleared the current selection.",
+            logMessage: `Assistant cleared the current selection on the ${target.label}.`,
             output: {
               success: true,
-              currentView: viewSummary,
+              traceRole: target.targetKey,
+              currentView: buildTargetViewSummary(target.targetKey),
             },
           };
         }
 
         case "compare_with_previous": {
           const limit = clampNumber(toolCall.arguments.limit, 1, 12, 6);
-          const comparison = buildTraceDiffSummary(
-            previousTraceSnapshot,
-            currentTraceSnapshot
-          );
+          const comparison =
+            nextRuntime.mode === "deep"
+              ? buildTraceDiffSummary(baselineTraceSnapshot, candidateTraceSnapshot)
+              : buildTraceDiffSummary(previousTraceSnapshot, singleTraceSnapshot);
 
           return {
             runtime: nextRuntime,
             logMessage: comparison?.available
-              ? "Assistant compared the current trace with the preserved previous trace."
-              : "Assistant checked for a previous trace comparison but none is available yet.",
-            output: comparison
-              ? {
-                  ...comparison,
-                  hotspotChanges: comparison.hotspotChanges.slice(0, limit),
-                  processChanges: comparison.processChanges.slice(0, limit),
-                  categoryChanges: comparison.categoryChanges.slice(0, limit),
-                }
-              : {
-                  success: false,
-                  error: "No comparison data is available.",
-                },
+              ? nextRuntime.mode === "deep"
+                ? "Assistant compared the baseline and candidate trace summaries."
+                : "Assistant compared the current trace with the preserved previous trace."
+              : "Assistant checked for comparison data but none is available yet.",
+            output:
+              comparison != null
+                ? {
+                    ...comparison,
+                    hotspotChanges: comparison.hotspotChanges.slice(0, limit),
+                    processChanges: comparison.processChanges.slice(0, limit),
+                    categoryChanges: comparison.categoryChanges.slice(0, limit),
+                  }
+                : {
+                    success: false,
+                    error: "No comparison data is available.",
+                  },
+          };
+        }
+
+        case "run_deep_compare": {
+          const limit = clampNumber(toolCall.arguments.limit, 1, 12, 6);
+          if (nextRuntime.mode !== "deep" || !deepCompareReport) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to run Deep Mode before both comparison traces were ready.",
+              output: {
+                success: false,
+                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+              },
+            };
+          }
+
+          return {
+            runtime: nextRuntime,
+            logMessage: "Assistant ran the deterministic Deep Mode compare report.",
+            output: {
+              id: deepCompareReport.id,
+              headline: deepCompareReport.headline,
+              normalization: deepCompareReport.normalization,
+              winner: deepCompareReport.winner,
+              summaryMetrics: deepCompareReport.summaryMetrics,
+              findings: deepCompareReport.findings.slice(0, limit),
+              caveats: deepCompareReport.caveats,
+              topChangedLoops: deepCompareReport.topChangedLoops.slice(0, limit),
+            },
+          };
+        }
+
+        case "inspect_compare_finding": {
+          if (nextRuntime.mode !== "deep" || !deepCompareReport) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to inspect a Deep Mode finding before the report was available.",
+              output: {
+                success: false,
+                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+              },
+            };
+          }
+
+          const findingId =
+            typeof toolCall.arguments.finding_id === "string"
+              ? toolCall.arguments.finding_id
+              : "";
+          const finding = findCompareFinding(deepCompareReport, findingId);
+
+          return {
+            runtime: nextRuntime,
+            logMessage: finding
+              ? `Assistant inspected the Deep Mode finding "${finding.title}".`
+              : "Assistant tried to inspect a Deep Mode finding that no longer exists.",
+            output:
+              finding ?? {
+                success: false,
+                error: `Finding "${findingId}" was not found in the current Deep Mode report.`,
+              },
+          };
+        }
+
+        case "focus_compare_region": {
+          if (nextRuntime.mode !== "deep" || !deepCompareReport) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to focus Deep Mode evidence before the compare report was available.",
+              output: {
+                success: false,
+                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+              },
+            };
+          }
+
+          const paddingRatio = clampNumber(toolCall.arguments.padding_ratio, 0, 2, 0.25);
+          const traceRole = isTraceRole(toolCall.arguments.trace_role)
+            ? toolCall.arguments.trace_role
+            : null;
+          const findingId =
+            typeof toolCall.arguments.finding_id === "string"
+              ? toolCall.arguments.finding_id
+              : null;
+          const regionId =
+            typeof toolCall.arguments.region_id === "string"
+              ? toolCall.arguments.region_id
+              : null;
+
+          const regions = [];
+
+          if (findingId) {
+            const finding = findCompareFinding(deepCompareReport, findingId);
+            if (finding) {
+              regions.push(
+                ...finding.evidence.filter((region) =>
+                  traceRole ? region.traceRole === traceRole : true
+                )
+              );
+            }
+          } else if (regionId) {
+            const region = findCompareRegion(deepCompareReport, regionId);
+            if (region && (!traceRole || region.traceRole === traceRole)) {
+              regions.push(region);
+            }
+          }
+
+          if (regions.length === 0) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to focus Deep Mode evidence, but no matching region was found.",
+              output: {
+                success: false,
+                error: "No matching Deep Mode region was found.",
+              },
+            };
+          }
+
+          const firstRegionByRole = new Map<TraceRole, (typeof regions)[number]>();
+          for (const region of regions) {
+            if (!firstRegionByRole.has(region.traceRole)) {
+              firstRegionByRole.set(region.traceRole, region);
+            }
+          }
+
+          let focusedCount = 0;
+          for (const [role, region] of firstRegionByRole) {
+            if (
+              focusRegionOnTarget(role, {
+                startTime: region.startTime,
+                endTime: region.endTime,
+                eventIds: region.eventIds,
+              }, paddingRatio)
+            ) {
+              focusedCount += 1;
+            }
+          }
+
+          if (focusedCount === 0) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant found compare evidence, but the linked traces are no longer loaded.",
+              output: {
+                success: false,
+                error: "The linked compare evidence is no longer available in the loaded traces.",
+              },
+            };
+          }
+
+          await waitForFrames();
+
+          return {
+            runtime: nextRuntime,
+            logMessage: `Assistant focused ${focusedCount} Deep Mode evidence region${focusedCount === 1 ? "" : "s"}.`,
+            output: {
+              success: true,
+              baselineView: buildTargetViewSummary("baseline"),
+              candidateView: buildTargetViewSummary("candidate"),
+            },
+          };
+        }
+
+        case "compare_spikes": {
+          const limit = clampNumber(toolCall.arguments.limit, 1, 12, 6);
+          if (nextRuntime.mode !== "deep" || !deepCompareReport) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to compare spikes before Deep Mode was ready.",
+              output: {
+                success: false,
+                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+              },
+            };
+          }
+
+          return {
+            runtime: nextRuntime,
+            logMessage: "Assistant compared spike and host-gap deltas.",
+            output: {
+              headline: deepCompareReport.headline,
+              normalization: deepCompareReport.normalization,
+              findings: deepCompareReport.spikeFindings.slice(0, limit),
+            },
+          };
+        }
+
+        case "compare_hotspots": {
+          const limit = clampNumber(toolCall.arguments.limit, 1, 12, 6);
+          if (nextRuntime.mode !== "deep" || !deepCompareReport) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to compare hotspots before Deep Mode was ready.",
+              output: {
+                success: false,
+                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+              },
+            };
+          }
+
+          return {
+            runtime: nextRuntime,
+            logMessage: "Assistant compared hotspot and signature deltas.",
+            output: {
+              headline: deepCompareReport.headline,
+              normalization: deepCompareReport.normalization,
+              findings: deepCompareReport.hotspotFindings.slice(0, limit),
+            },
+          };
+        }
+
+        case "compare_call_paths": {
+          const limit = clampNumber(toolCall.arguments.limit, 1, 12, 6);
+          if (nextRuntime.mode !== "deep" || !deepCompareReport) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to compare call paths before Deep Mode was ready.",
+              output: {
+                success: false,
+                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+              },
+            };
+          }
+
+          return {
+            runtime: nextRuntime,
+            logMessage: "Assistant compared call-path, thread, and loop deltas.",
+            output: {
+              headline: deepCompareReport.headline,
+              normalization: deepCompareReport.normalization,
+              callPathFindings: deepCompareReport.callPathFindings.slice(0, limit),
+              loopFindings: deepCompareReport.loopFindings.slice(0, limit),
+            },
+          };
+        }
+
+        case "search_repo_paths": {
+          const repoId =
+            typeof toolCall.arguments.repo_id === "string"
+              ? toolCall.arguments.repo_id
+              : "";
+          const repo = getRepoMention(repoId);
+          if (!repo) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to search a repo that is not attached.",
+              output: {
+                success: false,
+                error: `Repo "${repoId}" is not attached to this conversation.`,
+              },
+            };
+          }
+
+          const query =
+            typeof toolCall.arguments.query === "string" ? toolCall.arguments.query : "";
+          const limit = clampNumber(toolCall.arguments.limit, 1, 40, 12);
+          const output = await requestRepoContext({
+            action: "search_paths",
+            repo,
+            query,
+            limit,
+          });
+
+          return {
+            runtime: nextRuntime,
+            logMessage: `Assistant searched ${repo.url} for matching file paths.`,
+            output,
+          };
+        }
+
+        case "list_repo_directory": {
+          const repoId =
+            typeof toolCall.arguments.repo_id === "string"
+              ? toolCall.arguments.repo_id
+              : "";
+          const repo = getRepoMention(repoId);
+          if (!repo) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to list a repo directory that is not attached.",
+              output: {
+                success: false,
+                error: `Repo "${repoId}" is not attached to this conversation.`,
+              },
+            };
+          }
+
+          const path =
+            typeof toolCall.arguments.path === "string" ? toolCall.arguments.path : "";
+          const output = await requestRepoContext({
+            action: "list_directory",
+            repo,
+            path,
+          });
+
+          return {
+            runtime: nextRuntime,
+            logMessage: `Assistant listed ${path || "/"} in ${repo.url}.`,
+            output,
+          };
+        }
+
+        case "read_repo_file": {
+          const repoId =
+            typeof toolCall.arguments.repo_id === "string"
+              ? toolCall.arguments.repo_id
+              : "";
+          const repo = getRepoMention(repoId);
+          if (!repo) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to read a repo file from a repo that is not attached.",
+              output: {
+                success: false,
+                error: `Repo "${repoId}" is not attached to this conversation.`,
+              },
+            };
+          }
+
+          const path =
+            typeof toolCall.arguments.path === "string" ? toolCall.arguments.path : "";
+          const output = await requestRepoContext({
+            action: "read_file",
+            repo,
+            path,
+          });
+
+          return {
+            runtime: nextRuntime,
+            logMessage: `Assistant read ${path} from ${repo.url}.`,
+            output,
           };
         }
 
@@ -1232,10 +2407,19 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
       }
     },
     [
-      currentTraceSnapshot,
+      attachedRepos,
+      baselineCompareMetadata,
+      baselineTraceIndex,
+      baselineTraceSnapshot,
+      candidateCompareMetadata,
+      candidateTraceIndex,
+      candidateTraceSnapshot,
+      deepCompareReport,
       previousTraceSnapshot,
+      requestRepoContext,
       searchQuery,
-      traceIndex,
+      singleTraceIndex,
+      singleTraceSnapshot,
     ]
   );
 
@@ -1244,9 +2428,12 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
       const trimmed = message.trim();
       const outgoingAttachments = pendingAttachments.map(cloneAttachment);
       if ((trimmed.length === 0 && outgoingAttachments.length === 0) || chatBusy) return;
+
       const { displayMessage, repoMentions } = extractGitHubMentions(trimmed);
+      const nextAttachedRepos = mergeRepoMentions(attachedRepos, repoMentions);
 
       setPendingAttachments([]);
+      setAttachedRepos(nextAttachedRepos);
       setChatMessages((previousMessages) => [
         ...previousMessages,
         {
@@ -1264,57 +2451,76 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
       let pendingToolOutputs: TraceChatToolResult[] | undefined;
       let pendingRequestAttachments =
         outgoingAttachments.length > 0 ? outgoingAttachments : undefined;
-      let pendingRepoMentions = repoMentions.length > 0 ? repoMentions : undefined;
+      let pendingRepoMentions = nextAttachedRepos.length > 0 ? nextAttachedRepos : undefined;
       const runtime: ToolExecutionRuntime = {
-        viewState,
-        selectedEvent,
+        mode,
+        single: {
+          viewState: singleTrace.viewState,
+          selectedEvent: singleTrace.selectedEvent,
+        },
+        baseline: {
+          viewState: baselineTrace.viewState,
+          selectedEvent: baselineTrace.selectedEvent,
+        },
+        candidate: {
+          viewState: candidateTrace.viewState,
+          selectedEvent: candidateTrace.selectedEvent,
+        },
       };
 
       try {
         for (let step = 0; step < TOOL_STEP_LIMIT; step += 1) {
           let streamedAssistantId: string | null = null;
           let streamedAssistantText = "";
+          const screenshotDataUrl = await captureCurrentScreenshot();
 
-          const response = await requestTraceChat({
-            previousResponseId: latestResponseId,
-            userMessage: pendingUserMessage,
-            toolOutputs: pendingToolOutputs,
-            context: buildRuntimeChatContext(runtime),
-            screenshotDataUrl: timelineApi?.captureImage() ?? null,
-            attachments: pendingRequestAttachments,
-            repoMentions: pendingRepoMentions,
-          }, (delta) => {
-            streamedAssistantText += delta;
+          const response = await requestTraceChat(
+            {
+              previousResponseId: latestResponseId,
+              userMessage: pendingUserMessage,
+              toolOutputs: pendingToolOutputs,
+              context: buildRuntimeChatContext(runtime),
+              screenshotDataUrl,
+              attachments: pendingRequestAttachments,
+              repoMentions: pendingRepoMentions,
+            },
+            (delta) => {
+              streamedAssistantText += delta;
 
-            if (!streamedAssistantId) {
-              streamedAssistantId = createLocalId("assistant");
-              setChatMessages((previousMessages) => [
-                ...previousMessages,
-                {
-                  id: streamedAssistantId!,
-                  role: "assistant",
-                  content: delta,
-                },
-              ]);
-              return;
+              if (!streamedAssistantId) {
+                streamedAssistantId = createLocalId("assistant");
+                setChatMessages((previousMessages) => [
+                  ...previousMessages,
+                  {
+                    id: streamedAssistantId!,
+                    role: "assistant",
+                    content: delta,
+                  },
+                ]);
+                return;
+              }
+
+              setChatMessages((previousMessages) =>
+                previousMessages.map((entry) =>
+                  entry.id === streamedAssistantId
+                    ? {
+                        ...entry,
+                        content: entry.content + delta,
+                      }
+                    : entry
+                )
+              );
             }
-
-            setChatMessages((previousMessages) =>
-              previousMessages.map((entry) =>
-                entry.id === streamedAssistantId
-                  ? {
-                      ...entry,
-                      content: entry.content + delta,
-                    }
-                  : entry
-              )
-            );
-          });
+          );
 
           latestResponseId = response.responseId;
           const finalAssistantText = response.assistantText.trim();
 
-          if (streamedAssistantId && finalAssistantText && finalAssistantText !== streamedAssistantText) {
+          if (
+            streamedAssistantId &&
+            finalAssistantText &&
+            finalAssistantText !== streamedAssistantText
+          ) {
             setChatMessages((previousMessages) =>
               previousMessages.map((entry) =>
                 entry.id === streamedAssistantId
@@ -1348,8 +2554,10 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
 
           for (const toolCall of response.toolCalls) {
             const execution = await executeToolCall(toolCall, runtime);
-            runtime.viewState = execution.runtime.viewState;
-            runtime.selectedEvent = execution.runtime.selectedEvent;
+            runtime.mode = execution.runtime.mode;
+            runtime.single = execution.runtime.single;
+            runtime.baseline = execution.runtime.baseline;
+            runtime.candidate = execution.runtime.candidate;
             nextToolOutputs.push({
               callId: toolCall.callId,
               name: toolCall.name,
@@ -1368,7 +2576,7 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
           pendingUserMessage = null;
           pendingToolOutputs = nextToolOutputs;
           pendingRequestAttachments = undefined;
-          pendingRepoMentions = undefined;
+          pendingRepoMentions = nextAttachedRepos.length > 0 ? nextAttachedRepos : undefined;
         }
 
         setChatErrorMessage("The assistant hit the current tool-step limit before finishing.");
@@ -1403,107 +2611,286 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
       }
     },
     [
+      attachedRepos,
+      baselineTrace.selectedEvent,
+      baselineTrace.viewState,
       buildRuntimeChatContext,
+      captureCurrentScreenshot,
+      candidateTrace.selectedEvent,
+      candidateTrace.viewState,
       chatBusy,
       chatResponseId,
       executeToolCall,
+      mode,
       pendingAttachments,
       requestTraceChat,
-      selectedEvent,
-      timelineApi,
-      viewState,
+      singleTrace.selectedEvent,
+      singleTrace.viewState,
     ]
   );
 
-  const renderMainWorkspace = () => (
-    <div className="h-full flex flex-col bg-white">
+  const renderCaptureOverlay = () =>
+    isCaptureMode ? (
+      <div
+        className="absolute inset-0 z-40 cursor-crosshair touch-none bg-black/20"
+        onPointerDown={handleCapturePointerDown}
+        onPointerMove={handleCapturePointerMove}
+        onPointerUp={(event) => {
+          void handleCapturePointerUp(event);
+        }}
+        onPointerCancel={cancelAreaCapture}
+      >
+        <div className="absolute left-4 top-4 rounded-sm bg-black/80 px-2 py-1 text-[11px] text-white shadow-sm">
+          Drag to capture an attachment
+        </div>
+
+        {captureRect && (
+          <div
+            className="absolute border border-[#7fb0ff] bg-white/10 shadow-[0_0_0_9999px_rgba(22,22,22,0.35)]"
+            style={{
+              left: captureRect.left,
+              top: captureRect.top,
+              width: captureRect.width,
+              height: captureRect.height,
+            }}
+          />
+        )}
+      </div>
+    ) : null;
+
+  const renderSingleWorkspace = () => (
+    <div className="flex h-full flex-col bg-white">
       <div ref={workspaceRef} className="relative flex-1 overflow-hidden">
-        {!traceData ? (
-          <EmptyState onLoadFile={handleLoadFile} />
+        {!singleTrace.traceData ? (
+          <EmptyState onLoadFile={() => handleOpenFilePicker("single")} />
         ) : (
           <div className="flex h-full overflow-hidden">
             <div className="flex min-h-0 flex-1 flex-col">
               <Minimap
-                traceData={traceData}
-                viewState={viewState}
-                onViewStateChange={setViewState}
-                timeBounds={timeBounds}
-              />
-              <Timeline
-                processes={processes}
-                viewState={viewState}
-                onViewStateChange={setViewState}
-                onEventSelect={setSelectedEvent}
-                selectedEvent={selectedEvent}
-                tool={tool}
-                searchQuery={searchQuery}
-                onRegisterApi={setTimelineApi}
+                traceData={singleTrace.traceData}
+                viewState={singleTrace.viewState}
+                onViewStateChange={(viewState) =>
+                  setSingleTrace((previousState) => ({
+                    ...previousState,
+                    viewState,
+                  }))
+                }
+                timeBounds={singleTimeBounds}
               />
 
-              {selectedEvent && (
+              <Timeline
+                processes={singleProcesses}
+                viewState={singleTrace.viewState}
+                onViewStateChange={(viewState) =>
+                  setSingleTrace((previousState) => ({
+                    ...previousState,
+                    viewState,
+                  }))
+                }
+                onEventSelect={(event) =>
+                  setSingleTrace((previousState) => ({
+                    ...previousState,
+                    selectedEvent: event,
+                  }))
+                }
+                selectedEvent={singleTrace.selectedEvent}
+                tool={singleTrace.tool}
+                searchQuery={searchQuery}
+                onRegisterApi={setSingleTimelineApi}
+              />
+
+              {singleTrace.selectedEvent && (
                 <DetailsPanel
-                  event={selectedEvent}
-                  processes={processes}
-                  onClose={() => setSelectedEvent(null)}
-                  onAttachToChat={handleAttachSelectionToChat}
+                  event={singleTrace.selectedEvent}
+                  processes={singleProcesses}
+                  onClose={() =>
+                    setSingleTrace((previousState) => ({
+                      ...previousState,
+                      selectedEvent: null,
+                    }))
+                  }
+                  onAttachToChat={() => attachSelectionFromTarget("single")}
                 />
               )}
             </div>
 
             <SideToolbar
-              tool={tool}
-              onToolChange={setTool}
+              tool={singleTrace.tool}
+              onToolChange={(tool) =>
+                setSingleTrace((previousState) => ({
+                  ...previousState,
+                  tool,
+                }))
+              }
               onZoomIn={handleZoomIn}
               onZoomOut={handleZoomOut}
               onFitToWindow={handleFitToWindow}
               onResetView={handleResetView}
-              hasData={traceData !== null}
+              hasData={singleTrace.traceData !== null}
             />
           </div>
         )}
 
-        {isCaptureMode && (
-          <div
-            className="absolute inset-0 z-40 cursor-crosshair touch-none bg-black/20"
-            onPointerDown={handleCapturePointerDown}
-            onPointerMove={handleCapturePointerMove}
-            onPointerUp={(event) => {
-              void handleCapturePointerUp(event);
-            }}
-            onPointerCancel={cancelAreaCapture}
-          >
-            <div className="absolute left-4 top-4 rounded-sm bg-black/80 px-2 py-1 text-[11px] text-white shadow-sm">
-              Drag to capture an attachment
-            </div>
-
-            {captureRect && (
-              <div
-                className="absolute border border-[#7fb0ff] bg-white/10 shadow-[0_0_0_9999px_rgba(22,22,22,0.35)]"
-                style={{
-                  left: captureRect.left,
-                  top: captureRect.top,
-                  width: captureRect.width,
-                  height: captureRect.height,
-                }}
-              />
-            )}
-          </div>
-        )}
+        {renderCaptureOverlay()}
       </div>
 
-      {traceData && (
+      {singleTrace.traceData && (
         <StatusBar
-          viewState={viewState}
-          processes={processes}
-          eventCount={traceData.traceEvents.filter((event) => event.ph !== "M").length}
-          selectedEvent={selectedEvent}
+          viewState={singleTrace.viewState}
+          processes={singleProcesses}
+          eventCount={singleTrace.traceData.traceEvents.filter((event) => event.ph !== "M").length}
+          selectedEvent={singleTrace.selectedEvent}
         />
       )}
     </div>
   );
 
+  const renderDeepWorkspace = () => (
+    <div className="flex h-full flex-col bg-white">
+      <div ref={workspaceRef} className="relative flex-1 overflow-hidden">
+        <ResizablePanelGroup direction="horizontal" className="h-full overflow-hidden">
+          <ResizablePanel
+            defaultSize={35}
+            minSize={16}
+          >
+            <TracePane
+              label="Baseline"
+              traceData={baselineTrace.traceData}
+              processes={baselineProcesses}
+              viewState={baselineTrace.viewState}
+              onViewStateChange={(viewState) =>
+                setBaselineTrace((previousState) => ({
+                  ...previousState,
+                  viewState,
+                }))
+              }
+              timeBounds={baselineTimeBounds}
+              selectedEvent={baselineTrace.selectedEvent}
+              onEventSelect={(event) =>
+                setBaselineTrace((previousState) => ({
+                  ...previousState,
+                  selectedEvent: event,
+                }))
+              }
+              tool={baselineTrace.tool}
+              onToolChange={(tool) =>
+                setBaselineTrace((previousState) => ({
+                  ...previousState,
+                  tool,
+                }))
+              }
+              searchQuery={searchQuery}
+              onRegisterApi={setBaselineTimelineApi}
+              onZoomIn={() =>
+                setBaselineTrace((previousState) => ({
+                  ...previousState,
+                  viewState: zoomViewState(previousState.viewState, 1 / 1.5),
+                }))
+              }
+              onZoomOut={() =>
+                setBaselineTrace((previousState) => ({
+                  ...previousState,
+                  viewState: zoomViewState(previousState.viewState, 1.5),
+                }))
+              }
+              onFitToWindow={() =>
+                setBaselineTrace((previousState) => ({
+                  ...previousState,
+                  viewState: fitViewStateToBounds(baselineTimeBounds, 0.02),
+                }))
+              }
+              onResetView={() =>
+                setBaselineTrace((previousState) => ({
+                  ...previousState,
+                  viewState: fitViewStateToBounds(baselineTimeBounds, 0.05),
+                }))
+              }
+              onAttachSelection={() => attachSelectionFromTarget("baseline")}
+            />
+          </ResizablePanel>
+
+          <ResizableHandle withHandle className="bg-[#d3d3d3]" />
+
+          <ResizablePanel
+            defaultSize={35}
+            minSize={16}
+          >
+            <TracePane
+              label="Candidate"
+              traceData={candidateTrace.traceData}
+              processes={candidateProcesses}
+              viewState={candidateTrace.viewState}
+              onViewStateChange={(viewState) =>
+                setCandidateTrace((previousState) => ({
+                  ...previousState,
+                  viewState,
+                }))
+              }
+              timeBounds={candidateTimeBounds}
+              selectedEvent={candidateTrace.selectedEvent}
+              onEventSelect={(event) =>
+                setCandidateTrace((previousState) => ({
+                  ...previousState,
+                  selectedEvent: event,
+                }))
+              }
+              tool={candidateTrace.tool}
+              onToolChange={(tool) =>
+                setCandidateTrace((previousState) => ({
+                  ...previousState,
+                  tool,
+                }))
+              }
+              searchQuery={searchQuery}
+              onRegisterApi={setCandidateTimelineApi}
+              onZoomIn={() =>
+                setCandidateTrace((previousState) => ({
+                  ...previousState,
+                  viewState: zoomViewState(previousState.viewState, 1 / 1.5),
+                }))
+              }
+              onZoomOut={() =>
+                setCandidateTrace((previousState) => ({
+                  ...previousState,
+                  viewState: zoomViewState(previousState.viewState, 1.5),
+                }))
+              }
+              onFitToWindow={() =>
+                setCandidateTrace((previousState) => ({
+                  ...previousState,
+                  viewState: fitViewStateToBounds(candidateTimeBounds, 0.02),
+                }))
+              }
+              onResetView={() =>
+                setCandidateTrace((previousState) => ({
+                  ...previousState,
+                  viewState: fitViewStateToBounds(candidateTimeBounds, 0.05),
+                }))
+              }
+              onAttachSelection={() => attachSelectionFromTarget("candidate")}
+            />
+          </ResizablePanel>
+
+          <ResizableHandle withHandle className="bg-[#d3d3d3]" />
+
+          <ResizablePanel
+            defaultSize={30}
+            minSize={14}
+          >
+            <CompareFindingsPanel
+              report={deepCompareReport}
+              onFocusFinding={handleFocusCompareFinding}
+            />
+          </ResizablePanel>
+        </ResizablePanelGroup>
+
+        {renderCaptureOverlay()}
+      </div>
+    </div>
+  );
+
   return (
-    <div className="h-screen flex flex-col bg-white">
+    <div className="flex h-screen flex-col bg-white">
       <input
         ref={fileInputRef}
         type="file"
@@ -1512,32 +2899,41 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
         className="hidden"
       />
 
-      <Toolbar
-        onLoadFile={handleLoadFile}
-        onZoomIn={handleZoomIn}
-        onZoomOut={handleZoomOut}
-        searchQuery={searchQuery}
-        onSearchChange={setSearchQuery}
-        hasData={traceData !== null}
-        filename={filename}
-        showFlowEvents={showFlowEvents}
-        onToggleFlowEvents={() => setShowFlowEvents(!showFlowEvents)}
-        showProcesses={showProcesses}
-        onToggleProcesses={() => setShowProcesses(!showProcesses)}
+      <CompareControls
+        mode={mode}
+        onModeChange={setMode}
+        baselineFilename={baselineTrace.filename}
+        candidateFilename={candidateTrace.filename}
+        singleFilename={singleTrace.filename}
+        onLoadSingle={() => handleOpenFilePicker("single")}
+        onLoadBaseline={() => handleOpenFilePicker("baseline")}
+        onLoadCandidate={() => handleOpenFilePicker("candidate")}
+        onExportReport={handleExportCompareReport}
+        canExport={deepCompareReport !== null}
+        onOpenCommandPalette={handleOpenCommandPalette}
       />
 
       <ResizablePanelGroup direction="horizontal" className="flex-1 overflow-hidden">
-        <ResizablePanel defaultSize={74} minSize={45}>
-          {renderMainWorkspace()}
+        <ResizablePanel defaultSize={74} minSize={35}>
+          {mode === "deep" ? renderDeepWorkspace() : renderSingleWorkspace()}
         </ResizablePanel>
+
         <ResizableHandle withHandle className="bg-[#ccc]" />
-        <ResizablePanel defaultSize={26} minSize={22}>
+
+        <ResizablePanel defaultSize={26} minSize={18}>
           <ChatPanel
             enabled={chatEnabled}
             model={chatModel}
-            hasTrace={traceData !== null}
+            mode={mode}
+            hasTrace={
+              mode === "deep"
+                ? baselineTrace.traceData !== null || candidateTrace.traceData !== null
+                : singleTrace.traceData !== null
+            }
             currentTraceLabel={chatContext.currentTrace?.label}
-            previousTraceLabel={chatContext.previousTrace?.label}
+            previousTraceLabel={mode === "deep" ? undefined : chatContext.previousTrace?.label}
+            baselineTraceLabel={baselineTraceSnapshot?.label}
+            candidateTraceLabel={candidateTraceSnapshot?.label}
             messages={chatMessages}
             attachments={pendingAttachments}
             isBusy={chatBusy}
@@ -1546,9 +2942,55 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
             onRemoveAttachment={handleRemoveAttachment}
             onSendMessage={handleSendMessage}
             onStartAreaCapture={handleStartAreaCapture}
+            onClearHistory={handleClearHistory}
           />
         </ResizablePanel>
       </ResizablePanelGroup>
+
+      <CommandPalette
+        open={isCommandPaletteOpen}
+        onOpenChange={setIsCommandPaletteOpen}
+        mode={mode}
+        hasTrace={
+          mode === "deep"
+            ? baselineTrace.traceData !== null || candidateTrace.traceData !== null
+            : singleTrace.traceData !== null
+        }
+        canExport={deepCompareReport !== null}
+        onLoadSingle={() => handleOpenFilePicker("single")}
+        onLoadBaseline={() => handleOpenFilePicker("baseline")}
+        onLoadCandidate={() => handleOpenFilePicker("candidate")}
+        onSetMode={setMode}
+        onExportReport={handleExportCompareReport}
+        onCaptureArea={handleStartAreaCapture}
+        onZoomIn={mode === "deep"
+          ? () =>
+              setCandidateTrace((previousState) => ({
+                ...previousState,
+                viewState: zoomViewState(previousState.viewState, 1 / 1.5),
+              }))
+          : handleZoomIn}
+        onZoomOut={mode === "deep"
+          ? () =>
+              setCandidateTrace((previousState) => ({
+                ...previousState,
+                viewState: zoomViewState(previousState.viewState, 1.5),
+              }))
+          : handleZoomOut}
+        onPanLeft={handlePanLeft}
+        onPanRight={handlePanRight}
+        onFitToWindow={mode === "deep"
+          ? () =>
+              setCandidateTrace((previousState) => ({
+                ...previousState,
+                viewState: fitViewStateToBounds(candidateTimeBounds, 0.02),
+              }))
+          : handleFitToWindow}
+        onSelectTool={handleSelectTool}
+        onPanTool={handlePanTool}
+        onClearSelection={handleClearSelection}
+        onClearHistory={handleClearHistory}
+      />
     </div>
   );
 }

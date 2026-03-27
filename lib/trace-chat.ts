@@ -12,7 +12,16 @@ export type TraceChatToolName =
   | "set_view_range"
   | "fit_to_trace"
   | "clear_selection"
-  | "compare_with_previous";
+  | "compare_with_previous"
+  | "run_deep_compare"
+  | "inspect_compare_finding"
+  | "focus_compare_region"
+  | "compare_spikes"
+  | "compare_hotspots"
+  | "compare_call_paths"
+  | "search_repo_paths"
+  | "list_repo_directory"
+  | "read_repo_file";
 
 export interface IndexedTraceEvent {
   id: string;
@@ -152,11 +161,139 @@ export interface TraceDiffSummary {
   categoryChanges: TraceMetricDelta[];
 }
 
+export type TraceRole = "baseline" | "candidate";
+
+export type TraceWorkloadKind = "prefill" | "decode" | "mixed" | "unknown";
+
+export type TraceNormalizationMode =
+  | "total"
+  | "per_request"
+  | "per_prompt_token"
+  | "per_output_token";
+
+export type CompareFindingKind =
+  | "summary"
+  | "hotspot"
+  | "signature"
+  | "self_time"
+  | "spike"
+  | "gap"
+  | "call_path"
+  | "loop"
+  | "thread";
+
+export interface TraceCompareMetadata {
+  traceId: string;
+  label: string;
+  workloadKind: TraceWorkloadKind;
+  modelLabel?: string;
+  hardwareLabel?: string;
+  requestCount?: number;
+  promptTokenCount?: number;
+  outputTokenCount?: number;
+  notes?: string;
+}
+
+export interface TraceNormalizationConfig {
+  mode: TraceNormalizationMode;
+  label: string;
+  baselineDenominator: number;
+  candidateDenominator: number;
+}
+
+export interface TraceCompareMetricValue {
+  raw: number;
+  normalized: number;
+}
+
+export interface TraceCompareMetricDelta {
+  name: string;
+  label: string;
+  unit: string;
+  baseline: TraceCompareMetricValue;
+  candidate: TraceCompareMetricValue;
+  delta: number;
+  deltaPercent: number | null;
+  normalizedDelta: number;
+  normalizedDeltaPercent: number | null;
+}
+
+export interface TraceCompareRegion {
+  id: string;
+  traceRole: TraceRole;
+  traceLabel: string;
+  title: string;
+  description: string;
+  startTime: number;
+  endTime: number;
+  processName?: string;
+  threadName?: string;
+  eventIds: string[];
+}
+
+export interface TraceCompareFinding {
+  id: string;
+  kind: CompareFindingKind;
+  title: string;
+  summary: string;
+  explanation: string;
+  impact: "improved" | "regressed" | "changed" | "mixed";
+  priority: number;
+  metric: TraceCompareMetricDelta;
+  labels: string[];
+  baselineSample?: string;
+  candidateSample?: string;
+  evidence: TraceCompareRegion[];
+}
+
+export interface TraceCompareLoopSummary {
+  signature: string;
+  baselineCount: number;
+  candidateCount: number;
+  baselineAvgDuration: number;
+  candidateAvgDuration: number;
+}
+
+export interface TraceCompareReport {
+  id: string;
+  createdAt: string;
+  available: boolean;
+  normalization: TraceNormalizationConfig;
+  baseline: TraceCompareMetadata;
+  candidate: TraceCompareMetadata;
+  winner: "baseline" | "candidate" | "mixed" | "unclear";
+  headline: string;
+  summaryMetrics: TraceCompareMetricDelta[];
+  findings: TraceCompareFinding[];
+  hotspotFindings: TraceCompareFinding[];
+  spikeFindings: TraceCompareFinding[];
+  callPathFindings: TraceCompareFinding[];
+  loopFindings: TraceCompareFinding[];
+  representativeRegions: TraceCompareRegion[];
+  topChangedLoops: TraceCompareLoopSummary[];
+  caveats: string[];
+}
+
+export interface DeepCompareContext {
+  enabled: boolean;
+  baselineTrace: TraceSnapshot | null;
+  candidateTrace: TraceSnapshot | null;
+  baselineView: ViewportSummary | null;
+  candidateView: ViewportSummary | null;
+  metadata: {
+    baseline: TraceCompareMetadata | null;
+    candidate: TraceCompareMetadata | null;
+  };
+  normalizationMode: TraceNormalizationMode;
+  report: TraceCompareReport | null;
+}
+
 export interface TraceChatContext {
   currentTrace: TraceSnapshot | null;
   previousTrace: TraceSnapshot | null;
   currentView: ViewportSummary | null;
   comparisonToPrevious: TraceDiffSummary | null;
+  deepCompare?: DeepCompareContext | null;
 }
 
 export interface AttachedTraceSummary {

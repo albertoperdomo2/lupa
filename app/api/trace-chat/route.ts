@@ -6,6 +6,7 @@ import type {
   TraceChatStreamEvent,
   TraceChatToolCall,
 } from "@/lib/trace-chat";
+import { buildGitHubRepoSnapshot } from "@/lib/github-repo";
 
 export const runtime = "nodejs";
 
@@ -36,6 +37,11 @@ Tool behavior:
 - Prefer inspecting with tools over guessing when a question is specific.
 - Use search_events to find candidate spans before calling focus_event or inspect_event.
 - Use compare_with_previous when the user asks what changed after a new trace is loaded.
+- If Deep Mode is enabled, use run_deep_compare first for pairwise analysis, then inspect_compare_finding or focus_compare_region for evidence.
+- In Deep Mode, search_events, inspect_event, inspect_current_view, focus_event, set_view_range, fit_to_trace, and clear_selection may target either the baseline or candidate trace via trace_role.
+- When a tool accepts trace_role, always provide it explicitly.
+- If one or more GitHub repos are attached, you may inspect them with repo tools before answering.
+- Use search_repo_paths or list_repo_directory to find candidate files, then use read_repo_file for exact code inspection.
 - Use inspect_current_view when you need a fresh summary of the visible window.
 - In this viewer, the "spikes" are instant events and very short spans rendered in the spike strip below the main stack rows.
 - When the user asks about spikes, use the spike-specific fields from inspect_current_view before answering.
@@ -44,7 +50,9 @@ Tool behavior:
 Context rules:
 - Messages that begin with APP_CONTEXT_UPDATE are authoritative app state from the latest UI render.
 - Messages that begin with APP_ATTACHMENT are frozen user-selected attachments from the UI and remain valid even if the live trace later changes.
+- Messages that begin with APP_REPO_ATTACHMENT are authoritative GitHub repo snapshots currently attached to the conversation.
 - If older app context conflicts with newer app context, trust the newest app context.
+- If Deep Mode is enabled, the deepCompare report is the authoritative deterministic diff between baseline and candidate traces.
 - When you refer to a specific span, include its process or thread when that helps disambiguate it.
 - When comparing traces, be explicit about whether the evidence comes from the current trace, the preserved previous trace summary, or both.
 `.trim();
@@ -67,8 +75,13 @@ const TOOL_DEFINITIONS = [
           type: "number",
           description: "Maximum number of matches to return.",
         },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: "Target trace. Use candidate when Deep Mode is active and you do not need the baseline.",
+        },
       },
-      required: ["query", "limit"],
+      required: ["query", "limit", "trace_role"],
       additionalProperties: false,
     },
   },
@@ -85,8 +98,13 @@ const TOOL_DEFINITIONS = [
           type: "string",
           description: "Opaque event id returned by the app context or search_events.",
         },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: "Target trace. Use candidate when Deep Mode is active and you do not need the baseline.",
+        },
       },
-      required: ["event_id"],
+      required: ["event_id", "trace_role"],
       additionalProperties: false,
     },
   },
@@ -103,8 +121,13 @@ const TOOL_DEFINITIONS = [
           type: "number",
           description: "Maximum number of top visible hotspots to emphasize.",
         },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: "Target trace. Use candidate when Deep Mode is active and you do not need the baseline.",
+        },
       },
-      required: ["limit"],
+      required: ["limit", "trace_role"],
       additionalProperties: false,
     },
   },
@@ -124,8 +147,13 @@ const TOOL_DEFINITIONS = [
           type: "number",
           description: "Extra context to keep around the event as a fraction of its duration.",
         },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: "Target trace. Use candidate when Deep Mode is active and you do not need the baseline.",
+        },
       },
-      required: ["event_id", "padding_ratio"],
+      required: ["event_id", "padding_ratio", "trace_role"],
       additionalProperties: false,
     },
   },
@@ -145,8 +173,13 @@ const TOOL_DEFINITIONS = [
           type: "number",
           description: "New viewport end time in microseconds.",
         },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: "Target trace. Use candidate when Deep Mode is active and you do not need the baseline.",
+        },
       },
-      required: ["start_time_us", "end_time_us"],
+      required: ["start_time_us", "end_time_us", "trace_role"],
       additionalProperties: false,
     },
   },
@@ -162,8 +195,13 @@ const TOOL_DEFINITIONS = [
           type: "boolean",
           description: "Whether to keep a small amount of edge padding around the full trace.",
         },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: "Target trace. Use candidate when Deep Mode is active and you do not need the baseline.",
+        },
       },
-      required: ["include_padding"],
+      required: ["include_padding", "trace_role"],
       additionalProperties: false,
     },
   },
@@ -179,8 +217,13 @@ const TOOL_DEFINITIONS = [
           type: "boolean",
           description: "Whether the viewport should remain unchanged.",
         },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: "Target trace. Use candidate when Deep Mode is active and you do not need the baseline.",
+        },
       },
-      required: ["keep_view"],
+      required: ["keep_view", "trace_role"],
       additionalProperties: false,
     },
   },
@@ -199,6 +242,196 @@ const TOOL_DEFINITIONS = [
         },
       },
       required: ["limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "run_deep_compare",
+    description:
+      "Return the deterministic Deep Mode compare report between the loaded baseline and candidate traces.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "number",
+          description: "Maximum number of compare findings to emphasize.",
+        },
+      },
+      required: ["limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "inspect_compare_finding",
+    description:
+      "Inspect one finding from the deterministic Deep Mode compare report, including its evidence regions.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        finding_id: {
+          type: "string",
+          description: "Opaque finding id returned by run_deep_compare or present in app context.",
+        },
+      },
+      required: ["finding_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "focus_compare_region",
+    description:
+      "Focus evidence regions from a Deep Mode compare finding or region id in the baseline and candidate traces.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        finding_id: {
+          type: "string",
+          description: "Finding id to focus, or an empty string when region_id is used instead.",
+        },
+        region_id: {
+          type: "string",
+          description: "Specific region id to focus, or an empty string when finding_id is used instead.",
+        },
+        trace_role: {
+          type: "string",
+          description: 'Trace role filter: "baseline", "candidate", or an empty string to focus both traces.',
+        },
+        padding_ratio: {
+          type: "number",
+          description: "Extra context to keep around the focused evidence region.",
+        },
+      },
+      required: ["finding_id", "region_id", "trace_role", "padding_ratio"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "compare_spikes",
+    description:
+      "Return the top Deep Mode findings about spike density, short events, and host gaps.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "number",
+          description: "Maximum number of spike findings to emphasize.",
+        },
+      },
+      required: ["limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "compare_hotspots",
+    description:
+      "Return the top Deep Mode findings about hotspots, signatures, and self-time changes.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "number",
+          description: "Maximum number of hotspot findings to emphasize.",
+        },
+      },
+      required: ["limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "compare_call_paths",
+    description:
+      "Return the top Deep Mode findings about changed call paths, threads, and repeated loops.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "number",
+          description: "Maximum number of call-path findings to emphasize.",
+        },
+      },
+      required: ["limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "search_repo_paths",
+    description:
+      "Search attached GitHub repo file paths by substring so you can find candidate files to read.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        repo_id: {
+          type: "string",
+          description: "Opaque attached-repo id from APP_REPO_ATTACHMENT.",
+        },
+        query: {
+          type: "string",
+          description: "Case-insensitive substring to match against repo file paths.",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of file path matches to return.",
+        },
+      },
+      required: ["repo_id", "query", "limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_repo_directory",
+    description:
+      "List the immediate children of a directory inside an attached GitHub repo.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        repo_id: {
+          type: "string",
+          description: "Opaque attached-repo id from APP_REPO_ATTACHMENT.",
+        },
+        path: {
+          type: "string",
+          description: 'Directory path to inspect, or an empty string for the repo root.',
+        },
+      },
+      required: ["repo_id", "path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "read_repo_file",
+    description:
+      "Read the exact contents of a file inside an attached GitHub repo.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        repo_id: {
+          type: "string",
+          description: "Opaque attached-repo id from APP_REPO_ATTACHMENT.",
+        },
+        path: {
+          type: "string",
+          description: "Exact repo-relative file path to read.",
+        },
+      },
+      required: ["repo_id", "path"],
       additionalProperties: false,
     },
   },
@@ -277,7 +510,44 @@ function buildAttachmentInputs(attachments: TraceChatAttachment[] | undefined) {
   return content;
 }
 
-function buildInput(body: TraceChatRequest) {
+async function buildRepoInputs(body: TraceChatRequest) {
+  const content: Array<Record<string, unknown>> = [];
+
+  for (const mention of body.repoMentions ?? []) {
+    try {
+      const snapshot = await buildGitHubRepoSnapshot(mention);
+      content.push({
+        type: "input_text",
+        text: [
+          "APP_REPO_ATTACHMENT",
+          "GitHub repo currently attached to the conversation. Use this summary as authoritative high-level repo context, and use repo tools for exact file inspection.",
+          JSON.stringify(snapshot, null, 2),
+        ].join("\n\n"),
+      });
+    } catch (error) {
+      content.push({
+        type: "input_text",
+        text: [
+          "APP_REPO_ATTACHMENT",
+          "A GitHub repo was attached, but the app could not fetch its snapshot.",
+          JSON.stringify(
+            {
+              id: mention.id,
+              url: mention.url,
+              error: error instanceof Error ? error.message : "Unknown GitHub fetch error.",
+            },
+            null,
+            2
+          ),
+        ].join("\n\n"),
+      });
+    }
+  }
+
+  return content;
+}
+
+async function buildInput(body: TraceChatRequest) {
   const input: Array<Record<string, unknown>> = [];
 
   for (const toolOutput of body.toolOutputs ?? []) {
@@ -305,6 +575,7 @@ function buildInput(body: TraceChatRequest) {
           ]
         : []),
       ...buildAttachmentInputs(body.attachments),
+      ...(await buildRepoInputs(body)),
     ],
   });
 
@@ -323,11 +594,11 @@ function buildInput(body: TraceChatRequest) {
   return input;
 }
 
-function buildOpenAiRequestBody(body: TraceChatRequest) {
+async function buildOpenAiRequestBody(body: TraceChatRequest) {
   return {
     model: DEFAULT_OPENAI_MODEL,
     instructions: TRACE_CHAT_INSTRUCTIONS,
-    input: buildInput(body),
+    input: await buildInput(body),
     tools: TOOL_DEFINITIONS,
     parallel_tool_calls: false,
     store: true,
@@ -451,13 +722,14 @@ function createTraceChatPayload(
 async function createStreamedResponse(
   body: TraceChatRequest
 ): Promise<Response | NextResponse<{ error: string }>> {
+  const openAiRequestBody = await buildOpenAiRequestBody({ ...body, stream: true });
   const upstreamResponse = await fetch(OPENAI_API_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
     },
-    body: JSON.stringify(buildOpenAiRequestBody({ ...body, stream: true })),
+    body: JSON.stringify(openAiRequestBody),
   });
 
   if (!upstreamResponse.ok) {
@@ -705,7 +977,7 @@ export async function POST(request: NextRequest) {
       "Content-Type": "application/json",
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
     },
-    body: JSON.stringify(buildOpenAiRequestBody(body)),
+    body: JSON.stringify(await buildOpenAiRequestBody(body)),
   });
 
   if (!upstreamResponse.ok) {

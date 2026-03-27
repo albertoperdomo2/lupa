@@ -25,14 +25,14 @@ export function DetailsPanel({
 
   return (
     <div className="h-[220px] min-h-0 shrink-0 bg-white border-t border-[#ccc] flex flex-col">
-      <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#ddd] bg-[#f0f0f0]">
-        <span className="text-xs font-medium text-[#333]">Selection Details</span>
-        <div className="flex items-center gap-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#ddd] bg-[#f0f0f0] px-3 py-1.5">
+        <span className="min-w-0 flex-1 text-xs font-medium text-[#333]">Selection Details</span>
+        <div className="flex shrink-0 items-center gap-1.5">
           <Button
             variant="outline"
             size="sm"
             onClick={onAttachToChat}
-            className="h-6 rounded-sm border-[#ccc] bg-white px-2 text-[11px] text-[#444] hover:bg-[#f8f8f8]"
+            className="h-6 whitespace-nowrap rounded-sm border-[#ccc] bg-white px-2 text-[11px] text-[#444] hover:bg-[#f8f8f8]"
           >
             <Paperclip className="h-3 w-3" />
             Attach to Chat

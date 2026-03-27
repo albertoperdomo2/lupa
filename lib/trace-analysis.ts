@@ -21,6 +21,96 @@ import type {
   ViewportSummary,
 } from "@/lib/trace-chat";
 
+export function buildProcessMap(traceData: TraceData | null): Map<number, Process> {
+  if (!traceData) return new Map<number, Process>();
+
+  const processMap = new Map<number, Process>();
+
+  for (const event of traceData.traceEvents) {
+    if (event.ph !== "M") continue;
+
+    if (event.name === "process_name") {
+      if (!processMap.has(event.pid)) {
+        processMap.set(event.pid, {
+          pid: event.pid,
+          name: String(event.args?.name || `Process ${event.pid}`),
+          threads: new Map(),
+        });
+      } else {
+        const process = processMap.get(event.pid)!;
+        process.name = String(event.args?.name || process.name);
+      }
+      continue;
+    }
+
+    if (event.name === "thread_name") {
+      if (!processMap.has(event.pid)) {
+        processMap.set(event.pid, {
+          pid: event.pid,
+          name: `Process ${event.pid}`,
+          threads: new Map(),
+        });
+      }
+
+      const process = processMap.get(event.pid)!;
+      if (!process.threads.has(event.tid)) {
+        process.threads.set(event.tid, {
+          pid: event.pid,
+          tid: event.tid,
+          name: String(event.args?.name || `Thread ${event.tid}`),
+          events: [],
+        });
+      } else {
+        const thread = process.threads.get(event.tid)!;
+        thread.name = String(event.args?.name || thread.name);
+      }
+    }
+  }
+
+  for (const event of traceData.traceEvents) {
+    if (event.ph === "M") continue;
+
+    if (!processMap.has(event.pid)) {
+      processMap.set(event.pid, {
+        pid: event.pid,
+        name: `Process ${event.pid}`,
+        threads: new Map(),
+      });
+    }
+
+    const process = processMap.get(event.pid)!;
+    if (!process.threads.has(event.tid)) {
+      process.threads.set(event.tid, {
+        pid: event.pid,
+        tid: event.tid,
+        name: `Thread ${event.tid}`,
+        events: [],
+      });
+    }
+
+    process.threads.get(event.tid)!.events.push(event);
+  }
+
+  for (const process of processMap.values()) {
+    for (const [tid, thread] of process.threads) {
+      if (thread.events.length === 0) {
+        process.threads.delete(tid);
+        continue;
+      }
+
+      thread.events.sort((a, b) => a.ts - b.ts);
+    }
+  }
+
+  for (const [pid, process] of processMap) {
+    if (process.threads.size === 0) {
+      processMap.delete(pid);
+    }
+  }
+
+  return processMap;
+}
+
 function toReference(event: IndexedTraceEvent): TraceEventReference {
   return {
     id: event.id,
