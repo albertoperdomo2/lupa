@@ -1,5 +1,10 @@
 import { TracingViewer } from "@/components/tracing/tracing-viewer";
 
 export default function Page() {
-  return <TracingViewer />;
+  return (
+    <TracingViewer
+      chatEnabled={Boolean(process.env.OPENAI_API_KEY)}
+      chatModel={process.env.OPENAI_MODEL || "gpt-5.4"}
+    />
+  );
 }

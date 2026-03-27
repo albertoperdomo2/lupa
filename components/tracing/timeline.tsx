@@ -2,7 +2,12 @@
 
 import { useRef, useEffect, useCallback, useState, useMemo } from "react";
 import type { TraceEvent, Process, ViewState } from "@/lib/trace-types";
-import { getEventColor, formatTimeShort } from "@/lib/trace-types";
+import {
+  formatTimeShort,
+  getEventColor,
+  isSpikeEvent,
+  SPIKE_EVENT_DURATION_THRESHOLD_US,
+} from "@/lib/trace-types";
 
 interface TimelineProps {
   processes: Map<number, Process>;
@@ -12,6 +17,7 @@ interface TimelineProps {
   selectedEvent: TraceEvent | null;
   tool: "select" | "pan";
   searchQuery: string;
+  onRegisterApi?: ((api: { captureImage: () => string | null } | null) => void) | undefined;
 }
 
 const ROW_HEIGHT = 14;
@@ -23,6 +29,18 @@ const MIN_EVENT_WIDTH = 1;
 
 interface NestedEvent extends TraceEvent {
   depth: number;
+}
+
+function getSpikeHeight(event: TraceEvent): number {
+  if ((event.dur ?? 0) > 0) {
+    const durationRatio = Math.min(
+      1,
+      (event.dur ?? 0) / SPIKE_EVENT_DURATION_THRESHOLD_US
+    );
+    return 8 + durationRatio * (SPIKE_AREA_HEIGHT - 16);
+  }
+
+  return 14;
 }
 
 // Calculate tick interval based on visible duration
@@ -68,6 +86,7 @@ export function Timeline({
   selectedEvent,
   tool,
   searchQuery,
+  onRegisterApi,
 }: TimelineProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -78,6 +97,48 @@ export function Timeline({
   const [hoveredEvent, setHoveredEvent] = useState<TraceEvent | null>(null);
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
   const [collapsedProcesses, setCollapsedProcesses] = useState<Set<number>>(new Set());
+
+  const captureImage = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || canvas.width === 0 || canvas.height === 0) return null;
+
+    const maxWidth = 1600;
+    const displayWidth = Math.max(canvasSize.width, 1);
+    const displayHeight = Math.max(canvasSize.height, 1);
+    const scale = Math.min(1, maxWidth / displayWidth);
+    const exportWidth = Math.max(1, Math.round(displayWidth * scale));
+    const exportHeight = Math.max(1, Math.round(displayHeight * scale));
+    const exportCanvas = document.createElement("canvas");
+    exportCanvas.width = exportWidth;
+    exportCanvas.height = exportHeight;
+    const exportContext = exportCanvas.getContext("2d");
+
+    if (!exportContext) return null;
+
+    exportContext.drawImage(
+      canvas,
+      0,
+      0,
+      canvas.width,
+      canvas.height,
+      0,
+      0,
+      exportWidth,
+      exportHeight
+    );
+
+    return exportCanvas.toDataURL("image/png");
+  }, [canvasSize.height, canvasSize.width]);
+
+  useEffect(() => {
+    if (!onRegisterApi) return;
+
+    onRegisterApi({
+      captureImage,
+    });
+
+    return () => onRegisterApi(null);
+  }, [captureImage, onRegisterApi]);
 
   // Calculate nested events with depth for flame graph
   const processedData = useMemo(() => {
@@ -94,15 +155,10 @@ export function Timeline({
       
       process.threads.forEach((thread) => {
         thread.events.forEach(e => {
-          if (e.ph === "X" || e.ph === "B") {
-            const dur = e.dur || 0;
-            if (dur < 1000) { // Very short events go to spikes
-              instantEvents.push(e);
-            } else {
-              allEvents.push(e);
-            }
-          } else if (e.ph === "i" || e.ph === "I" || e.ph === "R") {
+          if (isSpikeEvent(e)) {
             instantEvents.push(e);
+          } else if (e.ph === "X" || e.ph === "B") {
+            allEvents.push(e);
           }
         });
       });
@@ -466,7 +522,7 @@ export function Timeline({
         if (x < THREAD_HEADER_WIDTH || x > canvasSize.width) continue;
 
         const color = getEventColor(event, eventColorIndex++);
-        const spikeHeight = 5 + Math.random() * (SPIKE_AREA_HEIGHT - 10);
+        const spikeHeight = getSpikeHeight(event);
         
         ctx.strokeStyle = color;
         ctx.lineWidth = 1;
@@ -708,7 +764,7 @@ export function Timeline({
   return (
     <div
       ref={containerRef}
-      className="flex-1 overflow-hidden relative"
+      className="relative min-h-0 flex-1 overflow-hidden"
       style={{ cursor: tool === "pan" || isPanning ? "grab" : "default" }}
     >
       <canvas

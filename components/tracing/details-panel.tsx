@@ -1,37 +1,53 @@
 "use client";
 
-import { X } from "lucide-react";
+import { Paperclip, X } from "lucide-react";
 import type { TraceEvent, Process } from "@/lib/trace-types";
 import { formatTime, getEventColor } from "@/lib/trace-types";
 import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@/components/ui/scroll-area";
 
 interface DetailsPanelProps {
   event: TraceEvent | null;
   processes: Map<number, Process>;
   onClose: () => void;
+  onAttachToChat: () => void;
 }
 
-export function DetailsPanel({ event, processes, onClose }: DetailsPanelProps) {
+export function DetailsPanel({
+  event,
+  processes,
+  onClose,
+  onAttachToChat,
+}: DetailsPanelProps) {
   if (!event) return null;
 
   const process = processes.get(event.pid);
   const thread = process?.threads.get(event.tid);
 
   return (
-    <div className="h-[200px] bg-white border-t border-[#ccc] flex flex-col">
+    <div className="h-[220px] min-h-0 shrink-0 bg-white border-t border-[#ccc] flex flex-col">
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#ddd] bg-[#f0f0f0]">
         <span className="text-xs font-medium text-[#333]">Selection Details</span>
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={onClose}
-          className="h-5 w-5 p-0 text-[#666] hover:text-[#333] hover:bg-[#ddd]"
-        >
-          <X className="h-3.5 w-3.5" />
-        </Button>
+        <div className="flex items-center gap-1.5">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onAttachToChat}
+            className="h-6 rounded-sm border-[#ccc] bg-white px-2 text-[11px] text-[#444] hover:bg-[#f8f8f8]"
+          >
+            <Paperclip className="h-3 w-3" />
+            Attach to Chat
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onClose}
+            className="h-5 w-5 p-0 text-[#666] hover:text-[#333] hover:bg-[#ddd]"
+          >
+            <X className="h-3.5 w-3.5" />
+          </Button>
+        </div>
       </div>
-      <ScrollArea className="flex-1">
+      <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="p-3">
           {/* Event Name with Color Indicator */}
           <div className="flex items-center gap-2 mb-3">
@@ -68,7 +84,7 @@ export function DetailsPanel({ event, processes, onClose }: DetailsPanelProps) {
             </div>
           )}
         </div>
-      </ScrollArea>
+      </div>
     </div>
   );
 }

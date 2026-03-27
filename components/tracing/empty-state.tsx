@@ -5,10 +5,9 @@ import { Button } from "@/components/ui/button";
 
 interface EmptyStateProps {
   onLoadFile: () => void;
-  onLoadSample: () => void;
 }
 
-export function EmptyState({ onLoadFile, onLoadSample }: EmptyStateProps) {
+export function EmptyState({ onLoadFile }: EmptyStateProps) {
   return (
     <div className="flex-1 flex items-center justify-center bg-white">
       <div className="text-center max-w-lg px-4">
@@ -27,14 +26,6 @@ export function EmptyState({ onLoadFile, onLoadSample }: EmptyStateProps) {
           >
             <Upload className="h-4 w-4" />
             Load Trace File
-          </Button>
-          <Button 
-            variant="outline" 
-            onClick={onLoadSample} 
-            className="gap-2 border-[#ddd] text-[#333] hover:bg-[#f5f5f5]"
-          >
-            <FileJson className="h-4 w-4" />
-            Load Sample Trace
           </Button>
         </div>
         

@@ -1,7 +1,7 @@
 export interface TraceEvent {
   name: string;
   cat: string;
-  ph: "B" | "E" | "X" | "i" | "I" | "C" | "M" | "s" | "t" | "f";
+  ph: "B" | "E" | "X" | "i" | "I" | "C" | "M" | "R" | "s" | "t" | "f";
   ts: number;
   dur?: number;
   pid: number;
@@ -21,6 +21,7 @@ export interface TraceData {
     "os-name"?: string;
     "os-version"?: string;
     "physical-memory"?: number;
+    "trace-capture-datetime"?: string;
   };
 }
 
@@ -48,6 +49,8 @@ export interface ViewState {
   endTime: number;
   scale: number;
 }
+
+export const SPIKE_EVENT_DURATION_THRESHOLD_US = 1000;
 
 export const TRACE_COLORS = [
   "#4fc3f7", // blue
@@ -127,4 +130,16 @@ export function formatTimeShort(microseconds: number): string {
   } else {
     return `${(microseconds / 1000000).toFixed(2)} s`;
   }
+}
+
+export function isSpikeEvent(event: Pick<TraceEvent, "ph" | "dur">): boolean {
+  if (event.ph === "i" || event.ph === "I" || event.ph === "R") {
+    return true;
+  }
+
+  if (event.ph === "X" || event.ph === "B") {
+    return (event.dur ?? 0) < SPIKE_EVENT_DURATION_THRESHOLD_US;
+  }
+
+  return false;
 }
