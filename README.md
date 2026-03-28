@@ -2,7 +2,7 @@
 
 Chrome-style trace viewer for exploring flame graphs, asking questions about a trace, and comparing two runs side by side.
 
-Screenshot coming soon.
+![lupa UI](./lupa.png)
 
 ## Run It
 
