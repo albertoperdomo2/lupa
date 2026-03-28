@@ -48,15 +48,18 @@ jobs:
               throw error;
             }
 
-            versions.sort(
-              (left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime()
-            );
+            const taggedVersions = versions
+              .filter((version) => (version.metadata?.container?.tags ?? []).length > 0)
+              .sort(
+                (left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime()
+              );
 
             const keep = 3;
-            const toDelete = versions.slice(keep);
+            const toDelete = taggedVersions.slice(keep);
 
-            core.info(`Found ${versions.length} package versions for ghcr.io/${owner}/${packageName}.`);
-            core.info(`Keeping ${Math.min(keep, versions.length)} most recent version(s).`);
+            core.info(`Found ${versions.length} package version(s) total for ghcr.io/${owner}/${packageName}.`);
+            core.info(`Found ${taggedVersions.length} tagged image version(s).`);
+            core.info(`Keeping ${Math.min(keep, taggedVersions.length)} most recent tagged version(s).`);
 
             for (const version of toDelete) {
               const tags = (version.metadata?.container?.tags ?? []).join(', ') || '(untagged)';
