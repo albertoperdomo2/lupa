@@ -2,6 +2,7 @@
 
 import {
   Camera,
+  DatabaseZap,
   FileJson,
   GitCompareArrows,
   Hand,
@@ -49,6 +50,8 @@ interface CommandPaletteProps {
   onPanTool: () => void;
   onClearSelection: () => void;
   onClearHistory: () => void;
+  hasSavedTraces: boolean;
+  onClearSavedTraces: () => void;
 }
 
 function runAndClose(action: () => void, onOpenChange: (open: boolean) => void) {
@@ -77,6 +80,8 @@ export function CommandPalette({
   onPanTool,
   onClearSelection,
   onClearHistory,
+  hasSavedTraces,
+  onClearSavedTraces,
 }: CommandPaletteProps) {
   return (
     <CommandDialog
@@ -175,6 +180,13 @@ export function CommandPalette({
         <CommandSeparator />
 
         <CommandGroup heading="Session">
+          <CommandItem
+            disabled={!hasSavedTraces}
+            onSelect={() => runAndClose(onClearSavedTraces, onOpenChange)}
+          >
+            <DatabaseZap />
+            <span>Clear saved traces</span>
+          </CommandItem>
           <CommandItem onSelect={() => runAndClose(onClearHistory, onOpenChange)}>
             <Trash2 />
             <span>Clear chat history</span>

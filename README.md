@@ -4,6 +4,41 @@ Chrome-style trace viewer for exploring flame graphs, asking questions about a t
 
 Screenshot coming soon.
 
+## Run It
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/albertoperdomo2/lupa/main/scripts/install.sh | bash
+```
+
+That installs a tiny `lupa` CLI, creates `~/.lupa/.env`, pulls the published container image from `ghcr.io`, and starts the app in the background at `http://lupa.localhost:3874`.
+
+If you want the URL without a port, run on port `80`:
+
+```bash
+lupa run --port 80
+```
+
+That gives you `http://lupa.localhost`. It may require permission to bind a low port on your machine.
+
+If you are running a fork, override the image or raw install base:
+
+```bash
+LUPA_IMAGE=ghcr.io/<owner>/lupa:latest \
+LUPA_INSTALL_BASE_URL=https://raw.githubusercontent.com/<owner>/lupa/main \
+curl -fsSL https://raw.githubusercontent.com/<owner>/lupa/main/scripts/install.sh | bash
+```
+
+Useful commands:
+
+```bash
+lupa status
+lupa logs
+lupa stop
+lupa uninstall
+```
+
+Loaded traces persist locally on your device and are restored after reload until you clear them from the app.
+
 ## What It Is
 
 `lupa` is a local web app for:
@@ -15,7 +50,7 @@ Screenshot coming soon.
 
 ## How To Use It
 
-### 1. Install and run
+### 1. Contributor setup
 
 ```bash
 pnpm install
@@ -25,7 +60,7 @@ pnpm dev
 
 Open `http://localhost:3000`.
 
-If you want the chat agent, set your OpenAI key in `.env`:
+If you want Trace Agent locally in dev mode, set your OpenAI key in `.env`:
 
 ```env
 OPENAI_API_KEY=...
@@ -68,3 +103,5 @@ The app computes structured findings, explains the top differences, and lets you
 - The viewer is useful without the agent.
 - The agent features require a valid OpenAI API key.
 - Deep Mode assumes both traces are comparable runs of the same workload and environment.
+- The one-click install uses `http://lupa.localhost:3874` on purpose. It avoids `/etc/hosts` edits, local TLS setup, and port-80 conflicts while still feeling like a local app instead of a dev server.
+- Full trace payloads persist locally in IndexedDB. Chat history stays in local storage. Use `Clear Saved Traces` in the app when you want a clean session.

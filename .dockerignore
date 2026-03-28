@@ -1,0 +1,12 @@
+.git
+.github
+.next
+coverage
+node_modules
+.DS_Store
+*.log
+*.tsbuildinfo
+.env
+.env*.local
+README.md
+tests

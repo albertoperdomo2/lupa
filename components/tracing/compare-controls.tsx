@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  DatabaseZap,
   GitCompareArrows,
   Search,
   Upload,
@@ -21,6 +22,8 @@ interface CompareControlsProps {
   onExportReport?: () => void;
   canExport: boolean;
   onOpenCommandPalette: () => void;
+  hasSavedTraces: boolean;
+  onClearSavedTraces: () => void;
 }
 
 function FilenameChip({
@@ -54,6 +57,8 @@ export function CompareControls({
   onExportReport,
   canExport,
   onOpenCommandPalette,
+  hasSavedTraces,
+  onClearSavedTraces,
 }: CompareControlsProps) {
   return (
     <div className="border-b border-[#d4d4d4] bg-[#f8f8f8] px-3 py-2">
@@ -142,16 +147,36 @@ export function CompareControls({
               </Button>
             </>
           )}
+          {hasSavedTraces && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onClearSavedTraces}
+              className="h-8 rounded-sm border-[#d9d0d0] bg-white text-xs text-[#7a3a3a] hover:bg-[#fff4f4]"
+            >
+              <DatabaseZap className="h-3.5 w-3.5" />
+              Clear Saved Traces
+            </Button>
+          )}
         </div>
       </div>
 
-      {mode === "deep" && (
+      {(mode === "deep" || hasSavedTraces) && (
         <div className="mt-2 flex flex-wrap items-center gap-2">
-          <FilenameChip label="Baseline" value={baselineFilename} />
-          <FilenameChip label="Candidate" value={candidateFilename} />
-          <div className="text-[11px] text-[#666]">
-            Assuming same model, hardware, and workload family. Deep Mode compares raw runtime structure and timing deltas.
-          </div>
+          {mode === "deep" && (
+            <>
+              <FilenameChip label="Baseline" value={baselineFilename} />
+              <FilenameChip label="Candidate" value={candidateFilename} />
+              <div className="text-[11px] text-[#666]">
+                Assuming same model, hardware, and workload family. Deep Mode compares raw runtime structure and timing deltas.
+              </div>
+            </>
+          )}
+          {hasSavedTraces && (
+            <div className="text-[11px] text-[#666]">
+              Loaded traces persist on this device and are restored after reload until you clear them.
+            </div>
+          )}
         </div>
       )}
     </div>

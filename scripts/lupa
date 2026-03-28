@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LUPA_HOME="${LUPA_HOME:-$HOME/.lupa}"
+LUPA_BIN_DIR="${LUPA_BIN_DIR:-$HOME/.local/bin}"
+LUPA_ENV_FILE="${LUPA_ENV_FILE:-$LUPA_HOME/.env}"
+LUPA_STATE_FILE="${LUPA_STATE_FILE:-$LUPA_HOME/runtime.env}"
+LUPA_CONTAINER_NAME="${LUPA_CONTAINER_NAME:-lupa}"
+LUPA_IMAGE="${LUPA_IMAGE:-ghcr.io/albertoperdomo2/lupa:latest}"
+LUPA_PORT="${LUPA_PORT:-3874}"
+LUPA_RUNTIME="${LUPA_RUNTIME:-}"
+
+die() {
+  printf 'lupa: %s\n' "$*" >&2
+  exit 1
+}
+
+detect_runtime() {
+  if [[ -n "$LUPA_RUNTIME" ]]; then
+    command -v "$LUPA_RUNTIME" >/dev/null 2>&1 || die "container runtime \"$LUPA_RUNTIME\" is not installed"
+    printf '%s\n' "$LUPA_RUNTIME"
+    return
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    printf 'docker\n'
+    return
+  fi
+
+  if command -v podman >/dev/null 2>&1; then
+    printf 'podman\n'
+    return
+  fi
+
+  die "docker or podman is required"
+}
+
+ensure_home() {
+  mkdir -p "$LUPA_HOME"
+}
+
+ensure_env_file() {
+  if [[ -f "$LUPA_ENV_FILE" ]]; then
+    return
+  fi
+
+  cat >"$LUPA_ENV_FILE" <<'EOF'
+# Optional. Without this, Trace Agent stays disabled.
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5.4
+EOF
+  chmod 600 "$LUPA_ENV_FILE"
+}
+
+format_url() {
+  local port="${1:-$LUPA_PORT}"
+  if [[ "$port" == "80" ]]; then
+    printf 'http://lupa.localhost\n'
+    return
+  fi
+
+  printf 'http://lupa.localhost:%s\n' "$port"
+}
+
+save_state() {
+  local runtime="$1"
+  local image="$2"
+  local port="$3"
+
+  cat >"$LUPA_STATE_FILE" <<EOF
+RUNTIME=$runtime
+IMAGE=$image
+PORT=$port
+URL=$(format_url "$port")
+CONTAINER_NAME=$LUPA_CONTAINER_NAME
+EOF
+}
+
+load_state() {
+  if [[ -f "$LUPA_STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$LUPA_STATE_FILE"
+  else
+    RUNTIME="$(detect_runtime)"
+    IMAGE="$LUPA_IMAGE"
+    PORT="$LUPA_PORT"
+    URL="$(format_url "$PORT")"
+    CONTAINER_NAME="$LUPA_CONTAINER_NAME"
+  fi
+}
+
+container_exists() {
+  local runtime="$1"
+  local name="$2"
+  [[ -n "$("$runtime" ps -aq --filter "name=^/${name}$")" ]]
+}
+
+container_running() {
+  local runtime="$1"
+  local name="$2"
+  [[ -n "$("$runtime" ps -q --filter "name=^/${name}$")" ]]
+}
+
+cmd_run() {
+  local runtime image port
+  runtime="$(detect_runtime)"
+  image="$LUPA_IMAGE"
+  port="$LUPA_PORT"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --image)
+        [[ $# -ge 2 ]] || die "--image requires a value"
+        image="$2"
+        shift 2
+        ;;
+      --port)
+        [[ $# -ge 2 ]] || die "--port requires a value"
+        port="$2"
+        shift 2
+        ;;
+      --runtime)
+        [[ $# -ge 2 ]] || die "--runtime requires a value"
+        runtime="$2"
+        shift 2
+        ;;
+      *)
+        die "unknown option for run: $1"
+        ;;
+    esac
+  done
+
+  ensure_home
+  ensure_env_file
+
+  if container_exists "$runtime" "$LUPA_CONTAINER_NAME"; then
+    "$runtime" rm -f "$LUPA_CONTAINER_NAME" >/dev/null
+  fi
+
+  "$runtime" pull "$image" >/dev/null
+  "$runtime" run -d \
+    --name "$LUPA_CONTAINER_NAME" \
+    --restart unless-stopped \
+    --env-file "$LUPA_ENV_FILE" \
+    -p "127.0.0.1:${port}:3000" \
+    "$image" >/dev/null
+
+  save_state "$runtime" "$image" "$port"
+
+  printf 'lupa is running at %s\n' "$(format_url "$port")"
+  printf 'config: %s\n' "$LUPA_ENV_FILE"
+}
+
+cmd_stop() {
+  load_state
+  if container_exists "$RUNTIME" "$CONTAINER_NAME"; then
+    "$RUNTIME" stop "$CONTAINER_NAME" >/dev/null
+    printf 'stopped %s\n' "$CONTAINER_NAME"
+    return
+  fi
+
+  printf 'lupa is not running\n'
+}
+
+cmd_status() {
+  load_state
+  if container_running "$RUNTIME" "$CONTAINER_NAME"; then
+    printf 'running: %s\n' "$URL"
+    return
+  fi
+
+  if container_exists "$RUNTIME" "$CONTAINER_NAME"; then
+    printf 'stopped: %s\n' "$CONTAINER_NAME"
+    return
+  fi
+
+  printf 'not installed\n'
+}
+
+cmd_logs() {
+  load_state
+  container_exists "$RUNTIME" "$CONTAINER_NAME" || die "no lupa container found"
+  "$RUNTIME" logs -f "$CONTAINER_NAME"
+}
+
+cmd_uninstall() {
+  load_state
+
+  if container_exists "$RUNTIME" "$CONTAINER_NAME"; then
+    "$RUNTIME" rm -f "$CONTAINER_NAME" >/dev/null
+  fi
+
+  "$RUNTIME" image rm -f "$IMAGE" >/dev/null 2>&1 || true
+  rm -rf "$LUPA_HOME"
+
+  local installed_path="${LUPA_BIN_DIR}/lupa"
+  if [[ -f "$installed_path" ]]; then
+    rm -f "$installed_path"
+  fi
+
+  printf 'lupa was removed from this machine\n'
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  lupa run [--port PORT] [--image IMAGE] [--runtime docker|podman]
+  lupa stop
+  lupa status
+  lupa logs
+  lupa uninstall
+
+Defaults:
+  image:   $LUPA_IMAGE
+  url:     $(format_url "$LUPA_PORT")
+  env:     $LUPA_ENV_FILE
+EOF
+}
+
+main() {
+  local command="${1:-status}"
+  if [[ $# -gt 0 ]]; then
+    shift
+  fi
+
+  case "$command" in
+    run)
+      cmd_run "$@"
+      ;;
+    stop)
+      cmd_stop
+      ;;
+    status)
+      cmd_status
+      ;;
+    logs)
+      cmd_logs
+      ;;
+    uninstall)
+      cmd_uninstall
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      die "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"

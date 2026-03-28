@@ -35,6 +35,16 @@ import {
   searchTraceEvents,
 } from "@/lib/trace-analysis";
 import {
+  clearPersistedTraceSession,
+  loadPersistedTraceSession,
+  savePersistedTracePayload,
+  savePersistedViewerState,
+  type PersistedTraceEventRef,
+  type PersistedTracePanePayload,
+  type PersistedTracePaneUiState,
+  type RestoredTracePaneRecord,
+} from "@/lib/trace-persistence";
+import {
   buildTraceCompareReport,
   buildTraceCompareReportExport,
   findCompareFinding,
@@ -148,6 +158,74 @@ function createCompareMetadata(label: string): TraceCompareMetadata {
     traceId: label.toLowerCase().replace(/\s+/g, "-"),
     label,
     workloadKind: "unknown",
+  };
+}
+
+function toPersistedTraceEventRef(event: TraceEvent | null): PersistedTraceEventRef | null {
+  if (!event) return null;
+
+  return {
+    name: event.name,
+    ts: event.ts,
+    dur: event.dur,
+    pid: event.pid,
+    tid: event.tid,
+    ph: event.ph,
+  };
+}
+
+function findMatchingTraceEvent(
+  traceData: TraceData,
+  eventRef: PersistedTraceEventRef | null
+): TraceEvent | null {
+  if (!eventRef) return null;
+
+  return (
+    traceData.traceEvents.find(
+      (event) =>
+        event.name === eventRef.name &&
+        event.ts === eventRef.ts &&
+        (event.dur ?? 0) === (eventRef.dur ?? 0) &&
+        event.pid === eventRef.pid &&
+        event.tid === eventRef.tid &&
+        event.ph === eventRef.ph
+    ) ?? null
+  );
+}
+
+function buildPersistedTracePanePayload(
+  paneState: TracePaneState
+): PersistedTracePanePayload | null {
+  if (!paneState.traceData) return null;
+
+  return {
+    traceData: paneState.traceData,
+    traceLoadedAt: paneState.traceLoadedAt,
+    filename: paneState.filename,
+  };
+}
+
+function buildPersistedTracePaneUiState(
+  paneState: TracePaneState
+): PersistedTracePaneUiState {
+  return {
+    hasTrace: paneState.traceData !== null,
+    tool: paneState.tool,
+    viewState: paneState.viewState,
+    selectedEvent: toPersistedTraceEventRef(paneState.selectedEvent),
+  };
+}
+
+function restoreTracePaneState(record: RestoredTracePaneRecord | null): TracePaneState {
+  if (!record) return createEmptyTracePaneState();
+
+  return {
+    traceData: record.payload.traceData,
+    traceLoadedAt: record.payload.traceLoadedAt,
+    filename: record.payload.filename,
+    selectedEvent: findMatchingTraceEvent(record.payload.traceData, record.state.selectedEvent),
+    tool: record.state.tool,
+    viewState: record.state.viewState,
   };
 }
 
@@ -445,7 +523,62 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
   );
 
   useEffect(() => {
-    setIsHydrated(true);
+    if (typeof window === "undefined" || hasRestoredPersistentChatRef.current) return;
+
+    let cancelled = false;
+
+    const restorePersistedState = async () => {
+      try {
+        const rawSession = localStorage.getItem(TRACE_AGENT_CHAT_STORAGE_KEY);
+        if (rawSession) {
+          const parsed = JSON.parse(rawSession) as PersistedChatSession;
+          if (!cancelled && Array.isArray(parsed.messages)) {
+            setChatMessages(parsed.messages);
+          }
+          if (!cancelled && (typeof parsed.responseId === "string" || parsed.responseId === null)) {
+            setChatResponseId(parsed.responseId);
+          }
+          if (!cancelled && Array.isArray(parsed.repoMentions)) {
+            setAttachedRepos(parsed.repoMentions);
+          }
+        }
+      } catch {
+        // Ignore malformed persisted chat state.
+      }
+
+      try {
+        const rawTraceSnapshot = localStorage.getItem(TRACE_AGENT_TRACE_STORAGE_KEY);
+        if (!cancelled && rawTraceSnapshot) {
+          setPreviousTraceSnapshot(JSON.parse(rawTraceSnapshot) as TraceSnapshot);
+        }
+      } catch {
+        // Ignore malformed persisted trace state.
+      }
+
+      try {
+        const persistedTraceSession = await loadPersistedTraceSession();
+        if (!cancelled && persistedTraceSession) {
+          setMode(persistedTraceSession.mode);
+          setNormalizationMode(persistedTraceSession.normalizationMode);
+          setSingleTrace(restoreTracePaneState(persistedTraceSession.single));
+          setBaselineTrace(restoreTracePaneState(persistedTraceSession.baseline));
+          setCandidateTrace(restoreTracePaneState(persistedTraceSession.candidate));
+        }
+      } catch {
+        // Ignore malformed persisted trace state.
+      } finally {
+        if (!cancelled) {
+          hasRestoredPersistentChatRef.current = true;
+          setIsHydrated(true);
+        }
+      }
+    };
+
+    void restorePersistedState();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const singleTraceIndex = useMemo(
@@ -665,6 +798,30 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
   const captureRect = useMemo(
     () => normalizeCaptureRect(captureOrigin, captureCurrent),
     [captureCurrent, captureOrigin]
+  );
+  const singlePersistedPayload = useMemo(
+    () => buildPersistedTracePanePayload(singleTrace),
+    [singleTrace]
+  );
+  const baselinePersistedPayload = useMemo(
+    () => buildPersistedTracePanePayload(baselineTrace),
+    [baselineTrace]
+  );
+  const candidatePersistedPayload = useMemo(
+    () => buildPersistedTracePanePayload(candidateTrace),
+    [candidateTrace]
+  );
+  const singlePersistedUiState = useMemo(
+    () => buildPersistedTracePaneUiState(singleTrace),
+    [singleTrace]
+  );
+  const baselinePersistedUiState = useMemo(
+    () => buildPersistedTracePaneUiState(baselineTrace),
+    [baselineTrace]
+  );
+  const candidatePersistedUiState = useMemo(
+    () => buildPersistedTracePaneUiState(candidateTrace),
+    [candidateTrace]
   );
 
   const addToolMessage = useCallback((content: string) => {
@@ -1356,45 +1513,38 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
     setChatResponseId(null);
     setPendingAttachments([]);
     setAttachedRepos([]);
-    setPreviousTraceSnapshot(null);
 
     if (typeof window !== "undefined") {
       localStorage.removeItem(TRACE_AGENT_CHAT_STORAGE_KEY);
+    }
+  }, []);
+
+  const handleClearSavedTraces = useCallback(() => {
+    setMode("single");
+    setNormalizationMode("total");
+    setSingleTrace(createEmptyTracePaneState());
+    setBaselineTrace(createEmptyTracePaneState());
+    setCandidateTrace(createEmptyTracePaneState());
+    setPreviousTraceSnapshot(null);
+    setBaselineMetadata(createCompareMetadata("Baseline"));
+    setCandidateMetadata(createCompareMetadata("Candidate"));
+    setSingleTimelineApi(null);
+    setBaselineTimelineApi(null);
+    setCandidateTimelineApi(null);
+    setBaselineEvidenceHighlight(null);
+    setCandidateEvidenceHighlight(null);
+    setPendingAttachments([]);
+    setSearchQuery("");
+    cancelAreaCapture();
+
+    if (typeof window !== "undefined") {
       localStorage.removeItem(TRACE_AGENT_TRACE_STORAGE_KEY);
     }
-  }, []);
 
-  useEffect(() => {
-    if (typeof window === "undefined" || hasRestoredPersistentChatRef.current) return;
-    hasRestoredPersistentChatRef.current = true;
-
-    try {
-      const rawSession = localStorage.getItem(TRACE_AGENT_CHAT_STORAGE_KEY);
-      if (rawSession) {
-        const parsed = JSON.parse(rawSession) as PersistedChatSession;
-        if (Array.isArray(parsed.messages)) {
-          setChatMessages(parsed.messages);
-        }
-        if (typeof parsed.responseId === "string" || parsed.responseId === null) {
-          setChatResponseId(parsed.responseId);
-        }
-        if (Array.isArray(parsed.repoMentions)) {
-          setAttachedRepos(parsed.repoMentions);
-        }
-      }
-    } catch {
-      // Ignore malformed persisted chat state.
-    }
-
-    try {
-      const rawTraceSnapshot = localStorage.getItem(TRACE_AGENT_TRACE_STORAGE_KEY);
-      if (rawTraceSnapshot) {
-        setPreviousTraceSnapshot(JSON.parse(rawTraceSnapshot) as TraceSnapshot);
-      }
-    } catch {
-      // Ignore malformed persisted trace state.
-    }
-  }, []);
+    void clearPersistedTraceSession().catch(() => {
+      // Ignore client-side persistence failures.
+    });
+  }, [cancelAreaCapture]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !hasRestoredPersistentChatRef.current) return;
@@ -1419,6 +1569,62 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
     if (!singleTraceSnapshot) return;
     localStorage.setItem(TRACE_AGENT_TRACE_STORAGE_KEY, JSON.stringify(singleTraceSnapshot));
   }, [singleTraceSnapshot]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !hasRestoredPersistentChatRef.current) return;
+
+    void savePersistedTracePayload("single", singlePersistedPayload).catch(() => {
+      // Ignore persistence failures on the client.
+    });
+  }, [singlePersistedPayload]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !hasRestoredPersistentChatRef.current) return;
+
+    void savePersistedTracePayload("baseline", baselinePersistedPayload).catch(() => {
+      // Ignore persistence failures on the client.
+    });
+  }, [baselinePersistedPayload]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !hasRestoredPersistentChatRef.current) return;
+
+    void savePersistedTracePayload("candidate", candidatePersistedPayload).catch(() => {
+      // Ignore persistence failures on the client.
+    });
+  }, [candidatePersistedPayload]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !hasRestoredPersistentChatRef.current) return;
+
+    const hasAnyTrace =
+      singleTrace.traceData !== null ||
+      baselineTrace.traceData !== null ||
+      candidateTrace.traceData !== null;
+
+    void savePersistedViewerState(
+      hasAnyTrace
+        ? {
+            mode,
+            normalizationMode,
+            single: singlePersistedUiState,
+            baseline: baselinePersistedUiState,
+            candidate: candidatePersistedUiState,
+          }
+        : null
+    ).catch(() => {
+      // Ignore persistence failures on the client.
+    });
+  }, [
+    baselinePersistedUiState,
+    baselineTrace.traceData,
+    candidatePersistedUiState,
+    candidateTrace.traceData,
+    mode,
+    normalizationMode,
+    singlePersistedUiState,
+    singleTrace.traceData,
+  ]);
 
   useEffect(() => {
     const handleCommandPaletteShortcut = (event: KeyboardEvent) => {
@@ -2670,6 +2876,11 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
     ]
   );
 
+  const hasSavedTraces =
+    singleTrace.traceData !== null ||
+    baselineTrace.traceData !== null ||
+    candidateTrace.traceData !== null;
+
   if (!isHydrated) {
     return (
         <div className="flex h-screen items-center justify-center bg-white text-sm text-[#666]">
@@ -2965,6 +3176,8 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         onExportReport={handleExportCompareReport}
         canExport={deepCompareReport !== null}
         onOpenCommandPalette={handleOpenCommandPalette}
+        hasSavedTraces={hasSavedTraces}
+        onClearSavedTraces={handleClearSavedTraces}
       />
 
       <ResizablePanelGroup direction="horizontal" className="flex-1 min-w-0 min-h-0 overflow-hidden">
@@ -3044,6 +3257,8 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         onPanTool={handlePanTool}
         onClearSelection={handleClearSelection}
         onClearHistory={handleClearHistory}
+        hasSavedTraces={hasSavedTraces}
+        onClearSavedTraces={handleClearSavedTraces}
       />
     </div>
   );
