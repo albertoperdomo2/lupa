@@ -1,10 +1,5 @@
-# v0 sandbox internal files
-__v0_runtime_loader.js
-__v0_devtools.tsx
-__v0_jsx-dev-runtime.ts
+# Tool-generated local files
 .snowflake/
-.v0-trash/
-.vercel/
 next.user-config.*
 
 # Environment variables

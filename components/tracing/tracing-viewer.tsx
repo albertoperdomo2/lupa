@@ -53,10 +53,10 @@ import { EmptyState } from "./empty-state";
 import { Minimap } from "./minimap";
 import { SideToolbar } from "./side-toolbar";
 import { StatusBar } from "./status-bar";
-import { Timeline } from "./timeline";
+import { Timeline, type TimelineEvidenceHighlight } from "./timeline";
 import { TracePane } from "./trace-pane";
 
-interface TracingViewerProps {
+interface LupaAppProps {
   chatEnabled: boolean;
   chatModel: string;
 }
@@ -117,8 +117,8 @@ interface PersistedChatSession {
 const TOOL_STEP_LIMIT = 6;
 const MIN_CAPTURE_SIZE_PX = 24;
 const GITHUB_URL_REGEX = /https?:\/\/github\.com\/[^\s<>()\]]+/gi;
-const TRACE_AGENT_CHAT_STORAGE_KEY = "trace-agent-chat-session:v1";
-const TRACE_AGENT_TRACE_STORAGE_KEY = "trace-agent-last-trace:v1";
+const TRACE_AGENT_CHAT_STORAGE_KEY = "lupa-trace-agent-chat-session:v1";
+const TRACE_AGENT_TRACE_STORAGE_KEY = "lupa-trace-agent-last-trace:v1";
 
 function createLocalId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -145,7 +145,7 @@ function createEmptyTracePaneState(): TracePaneState {
 
 function createCompareMetadata(label: string): TraceCompareMetadata {
   return {
-    traceId: createLocalId(label.toLowerCase().replace(/\s+/g, "-")),
+    traceId: label.toLowerCase().replace(/\s+/g, "-"),
     label,
     workloadKind: "unknown",
   };
@@ -389,7 +389,8 @@ function mergeRepoMentions(
   return merged;
 }
 
-export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
+export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
+  const [isHydrated, setIsHydrated] = useState(false);
   const [mode, setMode] = useState<ViewerMode>("single");
   const [singleTrace, setSingleTrace] = useState<TracePaneState>(() => createEmptyTracePaneState());
   const [baselineTrace, setBaselineTrace] = useState<TracePaneState>(() =>
@@ -417,6 +418,10 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
   const [singleTimelineApi, setSingleTimelineApi] = useState<TimelineApi | null>(null);
   const [baselineTimelineApi, setBaselineTimelineApi] = useState<TimelineApi | null>(null);
   const [candidateTimelineApi, setCandidateTimelineApi] = useState<TimelineApi | null>(null);
+  const [baselineEvidenceHighlight, setBaselineEvidenceHighlight] =
+    useState<TimelineEvidenceHighlight | null>(null);
+  const [candidateEvidenceHighlight, setCandidateEvidenceHighlight] =
+    useState<TimelineEvidenceHighlight | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<TraceChatAttachment[]>([]);
   const [isCaptureMode, setIsCaptureMode] = useState(false);
   const [captureOrigin, setCaptureOrigin] = useState<CapturePoint | null>(null);
@@ -438,6 +443,10 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
     () => buildProcessMap(candidateTrace.traceData),
     [candidateTrace.traceData]
   );
+
+  useEffect(() => {
+    setIsHydrated(true);
+  }, []);
 
   const singleTraceIndex = useMemo(
     () => buildTraceIndex(singleTrace.traceData, singleProcesses),
@@ -783,6 +792,8 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
       setCaptureCurrent(null);
 
       if (target === "single") {
+        setBaselineEvidenceHighlight(null);
+        setCandidateEvidenceHighlight(null);
         const preservedPrevious = singleTraceSnapshot ?? previousTraceSnapshot;
         if (singleTraceSnapshot) {
           setPreviousTraceSnapshot(singleTraceSnapshot);
@@ -808,6 +819,7 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
       setMode("deep");
 
       if (target === "baseline") {
+        setBaselineEvidenceHighlight(null);
         setBaselineTrace((previousState) => ({
           ...previousState,
           traceData: data,
@@ -826,6 +838,7 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
         return;
       }
 
+      setCandidateEvidenceHighlight(null);
       setCandidateTrace((previousState) => ({
         ...previousState,
         traceData: data,
@@ -1157,10 +1170,37 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
       const finding = findCompareFinding(deepCompareReport, findingId);
       if (!finding) return;
 
+      let nextBaselineHighlight: TimelineEvidenceHighlight | null = null;
+      let nextCandidateHighlight: TimelineEvidenceHighlight | null = null;
       const seenRoles = new Set<TraceRole>();
+
       for (const region of finding.evidence) {
         if (seenRoles.has(region.traceRole)) continue;
         seenRoles.add(region.traceRole);
+
+        const targetIndex =
+          region.traceRole === "baseline" ? baselineTraceIndex : candidateTraceIndex;
+        const targetEvent =
+          region.eventIds[0] && targetIndex
+            ? targetIndex.eventById.get(region.eventIds[0])?.event ?? null
+            : null;
+        const nextHighlight: TimelineEvidenceHighlight = {
+          id: createLocalId(`evidence-${region.traceRole}`),
+          title: region.title,
+          description: region.description,
+          startTime: region.startTime,
+          endTime: region.endTime,
+          processName: region.processName,
+          threadName: region.threadName,
+          event: targetEvent,
+        };
+
+        if (region.traceRole === "baseline") {
+          nextBaselineHighlight = nextHighlight;
+        } else {
+          nextCandidateHighlight = nextHighlight;
+        }
+
         focusLiveCompareRegion(
           region.traceRole,
           region.startTime,
@@ -1168,8 +1208,11 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
           region.eventIds
         );
       }
+
+      setBaselineEvidenceHighlight(nextBaselineHighlight);
+      setCandidateEvidenceHighlight(nextCandidateHighlight);
     },
-    [deepCompareReport, focusLiveCompareRegion]
+    [baselineTraceIndex, candidateTraceIndex, deepCompareReport, focusLiveCompareRegion]
   );
 
   const handleZoomIn = useCallback(() => {
@@ -1289,14 +1332,14 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
     if (!deepCompareReport) return;
 
     const blob = new Blob([buildTraceCompareReportExport(deepCompareReport)], {
-      type: "application/json",
+      type: "text/markdown;charset=utf-8",
     });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
     anchor.download = `${
       baselineTrace.filename ?? baselineCompareMetadata.label
-    }-vs-${candidateTrace.filename ?? candidateCompareMetadata.label}.json`;
+    }-vs-${candidateTrace.filename ?? candidateCompareMetadata.label}.md`;
     anchor.click();
     URL.revokeObjectURL(url);
   }, [
@@ -2408,10 +2451,8 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
     },
     [
       attachedRepos,
-      baselineCompareMetadata,
       baselineTraceIndex,
       baselineTraceSnapshot,
-      candidateCompareMetadata,
       candidateTraceIndex,
       candidateTraceSnapshot,
       deepCompareReport,
@@ -2629,6 +2670,14 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
     ]
   );
 
+  if (!isHydrated) {
+    return (
+        <div className="flex h-screen items-center justify-center bg-white text-sm text-[#666]">
+        Loading lupa…
+      </div>
+    );
+  }
+
   const renderCaptureOverlay = () =>
     isCaptureMode ? (
       <div
@@ -2748,8 +2797,9 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
   const renderDeepWorkspace = () => (
     <div className="flex h-full flex-col bg-white">
       <div ref={workspaceRef} className="relative flex-1 overflow-hidden">
-        <ResizablePanelGroup direction="horizontal" className="h-full overflow-hidden">
+        <ResizablePanelGroup direction="horizontal" className="h-full min-w-0 min-h-0 overflow-hidden">
           <ResizablePanel
+            className="min-w-0 min-h-0 overflow-hidden"
             defaultSize={35}
             minSize={16}
           >
@@ -2806,12 +2856,14 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
                 }))
               }
               onAttachSelection={() => attachSelectionFromTarget("baseline")}
+              evidenceHighlight={baselineEvidenceHighlight}
             />
           </ResizablePanel>
 
           <ResizableHandle withHandle className="bg-[#d3d3d3]" />
 
           <ResizablePanel
+            className="min-w-0 min-h-0 overflow-hidden"
             defaultSize={35}
             minSize={16}
           >
@@ -2868,12 +2920,14 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
                 }))
               }
               onAttachSelection={() => attachSelectionFromTarget("candidate")}
+              evidenceHighlight={candidateEvidenceHighlight}
             />
           </ResizablePanel>
 
           <ResizableHandle withHandle className="bg-[#d3d3d3]" />
 
           <ResizablePanel
+            className="min-w-0 min-h-0 overflow-hidden"
             defaultSize={30}
             minSize={14}
           >
@@ -2913,14 +2967,14 @@ export function TracingViewer({ chatEnabled, chatModel }: TracingViewerProps) {
         onOpenCommandPalette={handleOpenCommandPalette}
       />
 
-      <ResizablePanelGroup direction="horizontal" className="flex-1 overflow-hidden">
-        <ResizablePanel defaultSize={74} minSize={35}>
+      <ResizablePanelGroup direction="horizontal" className="flex-1 min-w-0 min-h-0 overflow-hidden">
+        <ResizablePanel className="min-w-0 min-h-0 overflow-hidden" defaultSize={74} minSize={35}>
           {mode === "deep" ? renderDeepWorkspace() : renderSingleWorkspace()}
         </ResizablePanel>
 
         <ResizableHandle withHandle className="bg-[#ccc]" />
 
-        <ResizablePanel defaultSize={26} minSize={18}>
+        <ResizablePanel className="min-w-0 min-h-0 overflow-hidden" defaultSize={26} minSize={18}>
           <ChatPanel
             enabled={chatEnabled}
             model={chatModel}

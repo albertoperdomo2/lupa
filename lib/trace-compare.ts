@@ -102,6 +102,87 @@ function formatMetricValue(value: number, unit: string): string {
   return `${value.toFixed(2)} ${unit}`;
 }
 
+function escapeMarkdownCell(value: string): string {
+  return value.replace(/\|/g, "\\|");
+}
+
+function formatPercentValue(value: number | null): string {
+  if (value == null || Number.isNaN(value)) {
+    return "n/a";
+  }
+
+  return `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
+}
+
+function formatMetricForReport(metric: TraceCompareMetricDelta, side: "baseline" | "candidate"): string {
+  return formatMetricValue(metric[side].normalized, metric.unit);
+}
+
+function formatEvidenceRegion(region: TraceCompareRegion): string {
+  const parts = [
+    region.traceLabel,
+    `${formatTimeShort(region.startTime)} -> ${formatTimeShort(region.endTime)}`,
+  ];
+
+  if (region.processName) {
+    parts.push(region.processName);
+  }
+
+  if (region.threadName) {
+    parts.push(region.threadName);
+  }
+
+  return parts.join(" | ");
+}
+
+function buildFindingMarkdownBlock(
+  finding: TraceCompareFinding,
+  index: number
+): string[] {
+  const lines = [
+    `### ${index}. ${finding.title}`,
+    "",
+    `${finding.summary}`,
+    "",
+    `${finding.explanation}`,
+    "",
+    `- Impact: ${finding.impact}`,
+    `- Baseline: ${formatMetricForReport(finding.metric, "baseline")}`,
+    `- Candidate: ${formatMetricForReport(finding.metric, "candidate")}`,
+    `- Delta: ${formatMetricValue(Math.abs(finding.metric.normalizedDelta), finding.metric.unit)} (${formatPercentValue(finding.metric.normalizedDeltaPercent)})`,
+  ];
+
+  if (finding.evidence.length > 0) {
+    lines.push("- Evidence:");
+    for (const region of finding.evidence) {
+      lines.push(`  - ${formatEvidenceRegion(region)}`);
+    }
+  }
+
+  lines.push("");
+  return lines;
+}
+
+function appendFindingSection(
+  lines: string[],
+  title: string,
+  findings: TraceCompareFinding[],
+  limit: number
+) {
+  lines.push(`## ${title}`);
+  lines.push("");
+
+  if (findings.length === 0) {
+    lines.push("No findings available.");
+    lines.push("");
+    return;
+  }
+
+  for (const [index, finding] of findings.slice(0, limit).entries()) {
+    lines.push(...buildFindingMarkdownBlock(finding, index + 1));
+  }
+}
+
 function safePercentDelta(previous: number, current: number): number | null {
   if (previous === 0) return null;
   return ((current - previous) / previous) * 100;
@@ -1055,7 +1136,46 @@ export function buildTraceCompareReport(input: {
 }
 
 export function buildTraceCompareReportExport(report: TraceCompareReport): string {
-  return JSON.stringify(report, null, 2);
+  const lines: string[] = [
+    "# Deep Findings Report",
+    "",
+    `Generated: ${report.createdAt}`,
+    "",
+    "## Overview",
+    "",
+    `- Baseline: ${report.baseline.label}`,
+    `- Candidate: ${report.candidate.label}`,
+    `- Normalization: ${report.normalization.label}`,
+    `- Winner: ${report.winner}`,
+    "",
+    `${report.headline}`,
+    "",
+    "## Summary Metrics",
+    "",
+    "| Metric | Baseline | Candidate | Delta | Percent |",
+    "| --- | --- | --- | --- | --- |",
+    ...report.summaryMetrics.map((metric) => {
+      const delta = formatMetricValue(Math.abs(metric.normalizedDelta), metric.unit);
+      return `| ${escapeMarkdownCell(metric.label)} | ${escapeMarkdownCell(formatMetricForReport(metric, "baseline"))} | ${escapeMarkdownCell(formatMetricForReport(metric, "candidate"))} | ${escapeMarkdownCell(delta)} | ${escapeMarkdownCell(formatPercentValue(metric.normalizedDeltaPercent))} |`;
+    }),
+    "",
+  ];
+
+  appendFindingSection(lines, "Top Findings", report.findings, 6);
+  appendFindingSection(lines, "Spikes And Gaps", report.spikeFindings, 4);
+  appendFindingSection(lines, "Call Paths And Threads", report.callPathFindings, 4);
+  appendFindingSection(lines, "Loops", report.loopFindings, 4);
+
+  if (report.caveats.length > 0) {
+    lines.push("## Caveats");
+    lines.push("");
+    for (const caveat of report.caveats) {
+      lines.push(`- ${caveat}`);
+    }
+    lines.push("");
+  }
+
+  return `${lines.join("\n").trim()}\n`;
 }
 
 export function findCompareFinding(
@@ -1063,7 +1183,16 @@ export function findCompareFinding(
   findingId: string
 ): TraceCompareFinding | null {
   if (!report) return null;
-  return report.findings.find((finding) => finding.id === findingId) ?? null;
+
+  return (
+    [
+      ...report.findings,
+      ...report.hotspotFindings,
+      ...report.spikeFindings,
+      ...report.callPathFindings,
+      ...report.loopFindings,
+    ].find((finding) => finding.id === findingId) ?? null
+  );
 }
 
 export function findCompareRegion(

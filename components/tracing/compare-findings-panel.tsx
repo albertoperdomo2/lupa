@@ -97,6 +97,8 @@ function FindingCard({
   finding: TraceCompareFinding;
   onFocusFinding: (findingId: string) => void;
 }) {
+  const hasEvidence = finding.evidence.length > 0;
+
   return (
     <div className="rounded-sm border border-[#dddddd] bg-white p-3">
       <div className="mb-2 flex items-start justify-between gap-3">
@@ -126,8 +128,10 @@ function FindingCard({
           type="button"
           variant="outline"
           size="sm"
+          disabled={!hasEvidence}
           onClick={() => onFocusFinding(finding.id)}
           className="h-7 rounded-sm border-[#ccc] bg-white px-2 text-[11px] text-[#444] hover:bg-[#f7f7f7]"
+          title={hasEvidence ? "Focus evidence in the flame graphs" : "No focusable evidence is available for this finding"}
         >
           <Target className="h-3.5 w-3.5" />
           Focus Evidence
@@ -179,7 +183,7 @@ export function CompareFindingsPanel({
   }
 
   return (
-    <div className="flex h-full flex-col bg-[#fafafa]">
+    <div className="flex h-full min-w-0 min-h-0 flex-col overflow-hidden bg-[#fafafa]">
       <div className="border-b border-[#d9d9d9] bg-[#f3f3f3] px-3 py-2">
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">

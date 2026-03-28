@@ -193,7 +193,17 @@ export function Minimap({
 
       setDragStart(x);
     },
-    [isDragging, dragType, dragStart, viewState, onViewStateChange, pixelToTime, timeToPixel]
+    [
+      dragStart,
+      dragType,
+      isDragging,
+      onViewStateChange,
+      pixelToTime,
+      timeBounds.max,
+      timeBounds.min,
+      timeToPixel,
+      viewState,
+    ]
   );
 
   const handleMouseUp = useCallback(() => {

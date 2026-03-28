@@ -80,7 +80,7 @@ async function fetchGitHubJson<T>(path: string): Promise<T> {
   const response = await fetch(`${GITHUB_API_BASE}${path}`, {
     headers: {
       Accept: "application/vnd.github+json",
-      "User-Agent": "trace-agent",
+      "User-Agent": "lupa-trace-agent",
     },
     cache: "no-store",
   });
@@ -95,7 +95,7 @@ async function fetchGitHubJson<T>(path: string): Promise<T> {
 async function fetchGitHubText(url: string): Promise<string> {
   const response = await fetch(url, {
     headers: {
-      "User-Agent": "trace-agent",
+      "User-Agent": "lupa-trace-agent",
     },
     cache: "no-store",
   });

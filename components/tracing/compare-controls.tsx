@@ -63,11 +63,17 @@ export function CompareControls({
           onValueChange={(value) => onModeChange(value as "single" | "deep")}
           className="gap-0"
         >
-          <TabsList className="h-8 rounded-sm bg-[#ececec] p-[2px]">
-            <TabsTrigger value="single" className="h-7 rounded-sm px-3 text-xs">
+          <TabsList className="h-10 rounded-sm border border-[#d2d2d2] bg-[#ececec] p-[3px]">
+            <TabsTrigger
+              value="single"
+              className="h-8 rounded-sm px-4 text-xs font-semibold text-[#565656] data-[state=active]:border-[#1f1f1f] data-[state=active]:bg-[#1f1f1f] data-[state=active]:text-white data-[state=active]:shadow-sm"
+            >
               Single Trace
             </TabsTrigger>
-            <TabsTrigger value="deep" className="h-7 rounded-sm px-3 text-xs">
+            <TabsTrigger
+              value="deep"
+              className="h-8 rounded-sm px-4 text-xs font-semibold text-[#565656] data-[state=active]:border-[#1f1f1f] data-[state=active]:bg-[#1f1f1f] data-[state=active]:text-white data-[state=active]:shadow-sm"
+            >
               <GitCompareArrows className="h-3.5 w-3.5" />
               Deep Mode
             </TabsTrigger>
@@ -132,7 +138,7 @@ export function CompareControls({
                 onClick={onExportReport}
                 className="h-8 rounded-sm border-[#ccc] bg-white text-xs text-[#333] hover:bg-[#f4f4f4]"
               >
-                Export Report
+                Export Markdown
               </Button>
             </>
           )}

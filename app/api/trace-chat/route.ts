@@ -457,7 +457,7 @@ function buildAttachmentInputs(attachments: TraceChatAttachment[] | undefined) {
         type: "input_text",
         text: [
           "APP_ATTACHMENT",
-          `Image attachment "${attachment.label}" captured from the trace viewer.`,
+          `Image attachment "${attachment.label}" captured from lupa.`,
           JSON.stringify(
             {
               id: attachment.id,

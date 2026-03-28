@@ -5,7 +5,7 @@ import { DetailsPanel } from "@/components/tracing/details-panel";
 import { Minimap } from "@/components/tracing/minimap";
 import { SideToolbar } from "@/components/tracing/side-toolbar";
 import { StatusBar } from "@/components/tracing/status-bar";
-import { Timeline } from "@/components/tracing/timeline";
+import { Timeline, type TimelineEvidenceHighlight } from "@/components/tracing/timeline";
 
 interface TracePaneProps {
   label: string;
@@ -25,6 +25,7 @@ interface TracePaneProps {
   onFitToWindow: () => void;
   onResetView: () => void;
   onAttachSelection?: () => void;
+  evidenceHighlight?: TimelineEvidenceHighlight | null;
 }
 
 export function TracePane({
@@ -45,6 +46,7 @@ export function TracePane({
   onFitToWindow,
   onResetView,
   onAttachSelection,
+  evidenceHighlight,
 }: TracePaneProps) {
   if (!traceData) {
     return (
@@ -55,7 +57,7 @@ export function TracePane({
   }
 
   return (
-    <div className="flex h-full flex-col bg-white">
+    <div className="flex h-full min-w-0 min-h-0 flex-col overflow-hidden bg-white">
       <div className="border-b border-[#ddd] bg-[#f7f7f7] px-3 py-1.5">
         <div className="text-[11px] font-medium uppercase tracking-wide text-[#555]">{label}</div>
       </div>
@@ -78,6 +80,7 @@ export function TracePane({
             tool={tool}
             searchQuery={searchQuery}
             onRegisterApi={onRegisterApi}
+            evidenceHighlight={evidenceHighlight}
           />
 
           {selectedEvent && onAttachSelection && (

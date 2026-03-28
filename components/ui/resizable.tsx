@@ -26,7 +26,9 @@ function ResizablePanelGroup({
 const ForwardedResizablePanel = React.forwardRef<
   ImperativePanelHandle,
   React.ComponentProps<typeof ResizablePrimitive.Panel>
->((props, ref) => <ResizablePrimitive.Panel ref={ref} data-slot="resizable-panel" {...props} />)
+>(({ className, ...props }, ref) => (
+  <ResizablePrimitive.Panel ref={ref} data-slot="resizable-panel" className={className} {...props} />
+))
 
 ForwardedResizablePanel.displayName = 'ResizablePanel'
 

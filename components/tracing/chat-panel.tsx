@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -112,7 +113,7 @@ export function ChatPanel({
   }
 
   return (
-    <div className="h-full flex flex-col bg-[#fafafa]">
+    <div className="flex h-full min-w-0 min-h-0 flex-col overflow-hidden bg-[#fafafa]">
       <div className="flex items-center justify-between px-3 py-2 border-b border-[#ccc] bg-[#f0f0f0]">
         <div className="flex items-center gap-2 min-w-0">
           <div className="w-6 h-6 rounded-sm bg-white border border-[#d9d9d9] flex items-center justify-center">
@@ -172,7 +173,7 @@ export function ChatPanel({
           <div className="space-y-2">
             {isCaptureMode && (
               <div className="text-[11px] text-[#555] bg-[#eef3ff] border border-[#c8d7ff] rounded-sm px-2 py-1.5">
-                Drag over the trace viewer to capture an attached screenshot. Press
+                Drag over the flame graph to capture an attached screenshot. Press
                 <span className="font-medium"> Escape</span> to cancel.
               </div>
             )}
@@ -217,8 +218,8 @@ export function ChatPanel({
               size="icon-sm"
               disabled={!enabled || !hasTrace || isBusy || isCaptureMode}
               onClick={onStartAreaCapture}
-              aria-label="Capture an area of the trace viewer"
-              title="Capture an area of the trace viewer"
+              aria-label="Capture an area of the flame graph"
+              title="Capture an area of the flame graph"
               className="h-7 w-7 rounded-sm text-[#666] hover:bg-[#ebebeb] hover:text-[#333]"
             >
               <Camera className="h-3.5 w-3.5" />
@@ -669,9 +670,12 @@ function AttachmentPreview({
           </span>
         </div>
         <div className="overflow-hidden rounded-sm border border-black/10 bg-black/5">
-          <img
+          <Image
             src={attachment.imageDataUrl}
             alt={attachment.label}
+            unoptimized
+            width={attachment.width}
+            height={attachment.height}
             className={cn(
               "block w-full object-cover",
               compact ? "max-h-24" : "max-h-40"

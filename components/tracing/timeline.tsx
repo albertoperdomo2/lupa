@@ -18,17 +18,84 @@ interface TimelineProps {
   tool: "select" | "pan";
   searchQuery: string;
   onRegisterApi?: ((api: { captureImage: () => string | null } | null) => void) | undefined;
+  evidenceHighlight?: TimelineEvidenceHighlight | null;
 }
 
 const ROW_HEIGHT = 14;
 const PROCESS_HEADER_HEIGHT = 22;
-const THREAD_HEADER_WIDTH = 250;
+const THREAD_HEADER_WIDTH = 180;
 const TIME_RULER_HEIGHT = 22;
 const SPIKE_AREA_HEIGHT = 60;
+const THREAD_SECTION_GAP = 6;
 const MIN_EVENT_WIDTH = 1;
 
 interface NestedEvent extends TraceEvent {
   depth: number;
+}
+
+interface ProcessThreadData {
+  tid: number;
+  threadName: string;
+  maxDepth: number;
+  events: NestedEvent[];
+  instantEvents: TraceEvent[];
+}
+
+interface ThreadLayoutEntry {
+  tid: number;
+  threadName: string;
+  flameTop: number;
+  flameHeight: number;
+  spikeTop: number;
+  contentHeight: number;
+  eventCount: number;
+  spikeCount: number;
+}
+
+export interface TimelineEvidenceHighlight {
+  id: string;
+  title: string;
+  description?: string;
+  startTime: number;
+  endTime: number;
+  processName?: string;
+  threadName?: string;
+  event?: TraceEvent | null;
+}
+
+interface ProcessLayoutEntry {
+  pid: number;
+  processName: string;
+  headerTop: number;
+  contentTop: number;
+  contentHeight: number;
+  collapsed: boolean;
+  threadLayouts: ThreadLayoutEntry[];
+}
+
+interface HighlightRect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+interface HighlightOverlayGeometry {
+  band: HighlightRect;
+  exact: HighlightRect | null;
+  markerLeft: number;
+  markerTop: number;
+}
+
+function areSameTraceEvent(a: TraceEvent, b: TraceEvent): boolean {
+  return (
+    a.name === b.name &&
+    a.ts === b.ts &&
+    a.pid === b.pid &&
+    a.tid === b.tid &&
+    (a.dur ?? 0) === (b.dur ?? 0) &&
+    a.ph === b.ph
+  );
 }
 
 function getSpikeHeight(event: TraceEvent): number {
@@ -78,6 +145,72 @@ function getContrastColor(bgColor: string): string {
   return luminance > 0.5 ? "#000" : "#fff";
 }
 
+function truncateCanvasText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxWidth: number
+): string {
+  if (ctx.measureText(text).width <= maxWidth) {
+    return text;
+  }
+
+  let truncated = text;
+  while (truncated.length > 4 && ctx.measureText(`${truncated}...`).width > maxWidth) {
+    truncated = truncated.slice(0, -1);
+  }
+
+  return truncated.length < text.length ? `${truncated}...` : truncated;
+}
+
+function buildNestedEvents(events: TraceEvent[]): { maxDepth: number; events: NestedEvent[] } {
+  const sortedEvents = events.slice().sort((left, right) => {
+    if (left.ts !== right.ts) return left.ts - right.ts;
+    return (right.dur || 0) - (left.dur || 0);
+  });
+  const nestedEvents: NestedEvent[] = [];
+  const activeIntervals: { end: number; depth: number }[] = [];
+
+  for (const event of sortedEvents) {
+    const eventEnd = event.ts + (event.dur || 0);
+
+    while (activeIntervals.length > 0) {
+      let allEnded = true;
+      for (let index = activeIntervals.length - 1; index >= 0; index -= 1) {
+        if (activeIntervals[index].end > event.ts) {
+          allEnded = false;
+          break;
+        }
+      }
+      if (allEnded) {
+        activeIntervals.pop();
+      } else {
+        break;
+      }
+    }
+
+    const stillActive = activeIntervals.filter((interval) => interval.end > event.ts);
+    activeIntervals.length = 0;
+    activeIntervals.push(...stillActive);
+
+    let depth = 0;
+    for (const interval of activeIntervals) {
+      if (interval.end > event.ts) {
+        depth = Math.max(depth, interval.depth + 1);
+      }
+    }
+
+    nestedEvents.push({ ...event, depth });
+    activeIntervals.push({ end: eventEnd, depth });
+    activeIntervals.sort((left, right) => right.end - left.end);
+  }
+
+  const maxDepth = nestedEvents.reduce((max, event) => Math.max(max, event.depth), -1) + 1;
+  return {
+    maxDepth: Math.max(maxDepth, 1),
+    events: nestedEvents,
+  };
+}
+
 export function Timeline({
   processes,
   viewState,
@@ -87,6 +220,7 @@ export function Timeline({
   tool,
   searchQuery,
   onRegisterApi,
+  evidenceHighlight,
 }: TimelineProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -97,6 +231,16 @@ export function Timeline({
   const [hoveredEvent, setHoveredEvent] = useState<TraceEvent | null>(null);
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
   const [collapsedProcesses, setCollapsedProcesses] = useState<Set<number>>(new Set());
+  const [activeEvidenceHighlight, setActiveEvidenceHighlight] =
+    useState<TimelineEvidenceHighlight | null>(null);
+  const [isEvidenceHighlightFading, setIsEvidenceHighlightFading] = useState(false);
+  const evidenceHighlightTimeoutsRef = useRef<{
+    fade: number | null;
+    clear: number | null;
+  }>({
+    fade: null,
+    clear: null,
+  });
 
   const captureImage = useCallback(() => {
     const canvas = canvasRef.current;
@@ -142,107 +286,99 @@ export function Timeline({
 
   // Calculate nested events with depth for flame graph
   const processedData = useMemo(() => {
-    const result = new Map<number, {
-      maxDepth: number;
-      events: NestedEvent[];
-      instantEvents: TraceEvent[];
-    }>();
+    const result = new Map<number, { threads: ProcessThreadData[] }>();
 
     processes.forEach((process, pid) => {
-      // Collect all events for this process
-      const allEvents: TraceEvent[] = [];
-      const instantEvents: TraceEvent[] = [];
-      
-      process.threads.forEach((thread) => {
-        thread.events.forEach(e => {
-          if (isSpikeEvent(e)) {
-            instantEvents.push(e);
-          } else if (e.ph === "X" || e.ph === "B") {
-            allEvents.push(e);
-          }
-        });
-      });
+      const threads = [...process.threads.values()]
+        .sort((left, right) => left.tid - right.tid)
+        .map((thread) => {
+          const spanEvents = thread.events.filter(
+            (event) => !isSpikeEvent(event) && (event.ph === "X" || event.ph === "B")
+          );
+          const instantEvents = thread.events.filter((event) => isSpikeEvent(event));
+          const nested = buildNestedEvents(spanEvents);
 
-      // Sort by start time, then by duration (longer events first for proper nesting)
-      allEvents.sort((a, b) => {
-        if (a.ts !== b.ts) return a.ts - b.ts;
-        return (b.dur || 0) - (a.dur || 0);
-      });
+          return {
+            tid: thread.tid,
+            threadName: thread.name,
+            maxDepth: nested.maxDepth,
+            events: nested.events,
+            instantEvents,
+          };
+        })
+        .filter((thread) => thread.events.length > 0 || thread.instantEvents.length > 0);
 
-      // Calculate depths using interval tree approach
-      const nestedEvents: NestedEvent[] = [];
-      const activeIntervals: { end: number; depth: number }[] = [];
-
-      for (const event of allEvents) {
-        const eventEnd = event.ts + (event.dur || 0);
-
-        // Remove intervals that have ended before this event starts
-        while (activeIntervals.length > 0) {
-          // Find the deepest active interval
-          let allEnded = true;
-          for (let i = activeIntervals.length - 1; i >= 0; i--) {
-            if (activeIntervals[i].end > event.ts) {
-              allEnded = false;
-              break;
-            }
-          }
-          if (allEnded) {
-            activeIntervals.pop();
-          } else {
-            break;
-          }
-        }
-
-        // Clean up ended intervals
-        const stillActive = activeIntervals.filter(interval => interval.end > event.ts);
-        activeIntervals.length = 0;
-        activeIntervals.push(...stillActive);
-
-        // Find depth - it's the number of active overlapping intervals
-        let depth = 0;
-        for (const interval of activeIntervals) {
-          if (interval.end > event.ts) {
-            depth = Math.max(depth, interval.depth + 1);
-          }
-        }
-
-        nestedEvents.push({ ...event, depth });
-        activeIntervals.push({ end: eventEnd, depth });
-        
-        // Keep sorted by end time (descending)
-        activeIntervals.sort((a, b) => b.end - a.end);
-      }
-
-      const maxDepth = nestedEvents.reduce((max, e) => Math.max(max, e.depth), -1) + 1;
-
-      result.set(pid, { 
-        maxDepth: Math.max(maxDepth, 1),
-        events: nestedEvents,
-        instantEvents
-      });
+      result.set(pid, { threads });
     });
 
     return result;
   }, [processes]);
 
+  const processLayouts = useMemo(() => {
+    const layouts: ProcessLayoutEntry[] = [];
+    let currentY = TIME_RULER_HEIGHT;
+
+    processes.forEach((process, pid) => {
+      const data = processedData.get(pid);
+      const collapsed = collapsedProcesses.has(pid);
+      const headerTop = currentY;
+      const contentTop = headerTop + PROCESS_HEADER_HEIGHT;
+      const threadLayouts: ThreadLayoutEntry[] = [];
+      let threadCursorY = contentTop;
+
+      if (!collapsed && data) {
+        data.threads.forEach((thread, index) => {
+          if (index > 0) {
+            threadCursorY += THREAD_SECTION_GAP;
+          }
+
+          const flameHeight = thread.maxDepth * ROW_HEIGHT;
+          const spikeTop = threadCursorY + flameHeight;
+          const contentHeight = flameHeight + SPIKE_AREA_HEIGHT;
+
+          threadLayouts.push({
+            tid: thread.tid,
+            threadName: thread.threadName,
+            flameTop: threadCursorY,
+            flameHeight,
+            spikeTop,
+            contentHeight,
+            eventCount: thread.events.length,
+            spikeCount: thread.instantEvents.length,
+          });
+
+          threadCursorY += contentHeight;
+        });
+      }
+
+      const contentHeight =
+        threadLayouts.length > 0
+          ? threadCursorY - contentTop
+          : 0;
+
+      layouts.push({
+        pid,
+        processName: process.name,
+        headerTop,
+        contentTop,
+        contentHeight,
+        collapsed,
+        threadLayouts,
+      });
+
+      currentY += PROCESS_HEADER_HEIGHT + contentHeight;
+    });
+
+    return layouts;
+  }, [collapsedProcesses, processes, processedData]);
+
   // Calculate total height needed
   const totalHeight = useMemo(() => {
-    let height = TIME_RULER_HEIGHT;
-    
-    processes.forEach((process, pid) => {
-      height += PROCESS_HEADER_HEIGHT;
-      
-      if (!collapsedProcesses.has(pid)) {
-        const data = processedData.get(pid);
-        if (data) {
-          // Height for flame graph rows + spike area
-          height += data.maxDepth * ROW_HEIGHT + SPIKE_AREA_HEIGHT + 4;
-        }
-      }
-    });
-    
-    return height;
-  }, [processes, collapsedProcesses, processedData]);
+    const lastLayout = processLayouts[processLayouts.length - 1];
+    if (!lastLayout) return TIME_RULER_HEIGHT;
+
+    return lastLayout.headerTop + PROCESS_HEADER_HEIGHT + lastLayout.contentHeight;
+  }, [processLayouts]);
 
   // Resize observer
   useEffect(() => {
@@ -263,7 +399,8 @@ export function Timeline({
   const timeToPixel = useCallback(
     (time: number): number => {
       const visibleDuration = viewState.endTime - viewState.startTime;
-      const pixelsPerMicrosecond = (canvasSize.width - THREAD_HEADER_WIDTH) / visibleDuration;
+      const drawableWidth = Math.max(canvasSize.width - THREAD_HEADER_WIDTH, 1);
+      const pixelsPerMicrosecond = drawableWidth / Math.max(visibleDuration, 1);
       return THREAD_HEADER_WIDTH + (time - viewState.startTime) * pixelsPerMicrosecond;
     },
     [viewState, canvasSize.width]
@@ -273,53 +410,304 @@ export function Timeline({
   const pixelToTime = useCallback(
     (pixel: number): number => {
       const visibleDuration = viewState.endTime - viewState.startTime;
-      const pixelsPerMicrosecond = (canvasSize.width - THREAD_HEADER_WIDTH) / visibleDuration;
+      const drawableWidth = Math.max(canvasSize.width - THREAD_HEADER_WIDTH, 1);
+      const pixelsPerMicrosecond = drawableWidth / Math.max(visibleDuration, 1);
       return viewState.startTime + (pixel - THREAD_HEADER_WIDTH) / pixelsPerMicrosecond;
     },
     [viewState, canvasSize.width]
   );
 
-  // Find event at position
-  const findEventAtPosition = useCallback(
-    (x: number, y: number): TraceEvent | null => {
-      const time = pixelToTime(x);
-      let currentY = TIME_RULER_HEIGHT - scrollY;
+  const clearEvidenceHighlightTimeouts = useCallback(() => {
+    const { fade, clear } = evidenceHighlightTimeoutsRef.current;
+    if (fade !== null) {
+      window.clearTimeout(fade);
+      evidenceHighlightTimeoutsRef.current.fade = null;
+    }
+    if (clear !== null) {
+      window.clearTimeout(clear);
+      evidenceHighlightTimeoutsRef.current.clear = null;
+    }
+  }, []);
 
-      for (const [pid] of processes) {
-        currentY += PROCESS_HEADER_HEIGHT;
-        
-        if (collapsedProcesses.has(pid)) continue;
+  useEffect(() => {
+    if (!evidenceHighlight) return;
 
-        const data = processedData.get(pid);
-        if (!data) continue;
+    clearEvidenceHighlightTimeouts();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setActiveEvidenceHighlight(evidenceHighlight);
+    setIsEvidenceHighlightFading(false);
 
-        const flameGraphHeight = data.maxDepth * ROW_HEIGHT;
-        const flameGraphTop = currentY;
-        const flameGraphBottom = currentY + flameGraphHeight;
+    evidenceHighlightTimeoutsRef.current.fade = window.setTimeout(() => {
+      setIsEvidenceHighlightFading(true);
+    }, 4200);
 
-        if (y >= flameGraphTop && y < flameGraphBottom) {
-          // Find which depth row we're in
-          const relativeY = y - flameGraphTop;
-          const targetDepth = Math.floor(relativeY / ROW_HEIGHT);
-          
-          // Find events at this depth that contain the time
-          for (const event of data.events) {
-            if (event.depth === targetDepth) {
-              const eventStart = event.ts;
-              const eventEnd = event.ts + (event.dur || 0);
-              if (time >= eventStart && time <= eventEnd) {
-                return event;
-              }
-            }
-          }
+    evidenceHighlightTimeoutsRef.current.clear = window.setTimeout(() => {
+      setActiveEvidenceHighlight((currentHighlight) =>
+        currentHighlight?.id === evidenceHighlight.id ? null : currentHighlight
+      );
+      setIsEvidenceHighlightFading(false);
+    }, 5000);
+  }, [clearEvidenceHighlightTimeouts, evidenceHighlight]);
+
+  useEffect(() => clearEvidenceHighlightTimeouts, [clearEvidenceHighlightTimeouts]);
+
+  const resolveHighlightProcessId = useCallback(
+    (highlight: TimelineEvidenceHighlight | null): number | null => {
+      if (!highlight) return null;
+      if (highlight.event) return highlight.event.pid;
+
+      if (!highlight.processName) return null;
+
+      for (const [pid, process] of processes) {
+        if (process.name === highlight.processName) {
+          return pid;
         }
-
-        currentY += flameGraphHeight + SPIKE_AREA_HEIGHT + 4;
       }
 
       return null;
     },
-    [processes, pixelToTime, scrollY, collapsedProcesses, processedData]
+    [processes]
+  );
+
+  const resolveHighlightThreadLayout = useCallback(
+    (
+      highlight: TimelineEvidenceHighlight,
+      layout: ProcessLayoutEntry
+    ): ThreadLayoutEntry | null => {
+      if (highlight.event) {
+        return (
+          layout.threadLayouts.find((threadLayout) => threadLayout.tid === highlight.event?.tid) ??
+          null
+        );
+      }
+
+      if (highlight.threadName) {
+        return (
+          layout.threadLayouts.find((threadLayout) => threadLayout.threadName === highlight.threadName) ??
+          null
+        );
+      }
+
+      return null;
+    },
+    []
+  );
+
+  const resolveExactHighlightRect = useCallback(
+    (
+      highlight: TimelineEvidenceHighlight,
+      layout: ProcessLayoutEntry
+    ): HighlightRect | null => {
+      if (!highlight.event) return null;
+
+      const data = processedData.get(layout.pid);
+      if (!data) return null;
+      const threadLayout = resolveHighlightThreadLayout(highlight, layout);
+      if (!threadLayout) return null;
+      const threadData = data.threads.find((thread) => thread.tid === threadLayout.tid);
+      if (!threadData) return null;
+
+      if (isSpikeEvent(highlight.event)) {
+        const spikeEvent = threadData.instantEvents.find((event) =>
+          areSameTraceEvent(event, highlight.event!)
+        );
+        if (!spikeEvent) return null;
+
+        const spikeX = timeToPixel(spikeEvent.ts);
+        const spikeHeight = getSpikeHeight(spikeEvent);
+        const width = 16;
+
+        return {
+          left: Math.max(THREAD_HEADER_WIDTH, Math.min(canvasSize.width - width, spikeX - width / 2)),
+          top: threadLayout.spikeTop + SPIKE_AREA_HEIGHT - spikeHeight,
+          width,
+          height: Math.max(spikeHeight, 12),
+        };
+      }
+
+      const nestedEvent = threadData.events.find((event) =>
+        areSameTraceEvent(event, highlight.event!)
+      );
+      if (!nestedEvent) return null;
+
+      const eventStart = Math.min(
+        Math.max(timeToPixel(nestedEvent.ts), THREAD_HEADER_WIDTH),
+        canvasSize.width
+      );
+      const eventEnd = Math.min(
+        Math.max(timeToPixel(nestedEvent.ts + (nestedEvent.dur || 0)), THREAD_HEADER_WIDTH),
+        canvasSize.width
+      );
+
+      return {
+        left: eventStart,
+        top: threadLayout.flameTop + nestedEvent.depth * ROW_HEIGHT,
+        width: Math.max(eventEnd - eventStart, 10),
+        height: ROW_HEIGHT - 1,
+      };
+    },
+    [canvasSize.width, processedData, resolveHighlightThreadLayout, timeToPixel]
+  );
+
+  useEffect(() => {
+    if (!activeEvidenceHighlight) return;
+
+    const targetPid = resolveHighlightProcessId(activeEvidenceHighlight);
+    if (targetPid === null) return;
+
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setCollapsedProcesses((previousCollapsed) => {
+      if (!previousCollapsed.has(targetPid)) return previousCollapsed;
+
+      const nextCollapsed = new Set(previousCollapsed);
+      nextCollapsed.delete(targetPid);
+      return nextCollapsed;
+    });
+  }, [activeEvidenceHighlight, resolveHighlightProcessId]);
+
+  useEffect(() => {
+    if (!activeEvidenceHighlight || canvasSize.height <= TIME_RULER_HEIGHT) return;
+
+    const targetPid = resolveHighlightProcessId(activeEvidenceHighlight);
+    if (targetPid === null) return;
+
+    const layout = processLayouts.find((entry) => entry.pid === targetPid);
+    if (!layout || layout.collapsed) return;
+    const threadLayout = resolveHighlightThreadLayout(activeEvidenceHighlight, layout);
+
+    const exactRect = resolveExactHighlightRect(activeEvidenceHighlight, layout);
+    const focusTop = exactRect?.top ?? threadLayout?.flameTop ?? layout.contentTop;
+    const focusBottom = exactRect
+      ? exactRect.top + exactRect.height
+      : threadLayout
+        ? threadLayout.spikeTop + SPIKE_AREA_HEIGHT
+        : layout.contentTop + layout.contentHeight;
+    const focusCenter = (focusTop + focusBottom) / 2;
+    const maxScroll = Math.max(totalHeight - canvasSize.height, 0);
+    const nextScrollY = Math.max(0, Math.min(maxScroll, focusCenter - canvasSize.height * 0.36));
+
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setScrollY((previousScrollY) =>
+      Math.abs(previousScrollY - nextScrollY) < 4 ? previousScrollY : nextScrollY
+    );
+  }, [
+    activeEvidenceHighlight,
+    canvasSize.height,
+    processLayouts,
+    resolveExactHighlightRect,
+    resolveHighlightProcessId,
+    resolveHighlightThreadLayout,
+    totalHeight,
+  ]);
+
+  const highlightOverlayGeometry = useMemo<HighlightOverlayGeometry | null>(() => {
+    if (!activeEvidenceHighlight || canvasSize.width <= THREAD_HEADER_WIDTH) return null;
+
+    const targetPid = resolveHighlightProcessId(activeEvidenceHighlight);
+    if (targetPid === null) return null;
+
+    const layout = processLayouts.find((entry) => entry.pid === targetPid);
+    if (!layout || layout.collapsed) return null;
+    const threadLayout = resolveHighlightThreadLayout(activeEvidenceHighlight, layout);
+
+    const bandLeft = Math.max(
+      THREAD_HEADER_WIDTH,
+      Math.min(canvasSize.width - 2, timeToPixel(activeEvidenceHighlight.startTime))
+    );
+    const bandRight = Math.max(
+      bandLeft + 2,
+      Math.min(canvasSize.width, timeToPixel(activeEvidenceHighlight.endTime))
+    );
+    const bandTop = Math.max(
+      TIME_RULER_HEIGHT,
+      (threadLayout?.flameTop ?? layout.contentTop) - scrollY
+    );
+    const bandBottom = Math.min(
+      canvasSize.height,
+      (
+        threadLayout
+          ? threadLayout.spikeTop + SPIKE_AREA_HEIGHT
+          : layout.contentTop + layout.contentHeight
+      ) - scrollY
+    );
+
+    if (bandBottom <= bandTop) return null;
+
+    const exactRectAbs = resolveExactHighlightRect(activeEvidenceHighlight, layout);
+    const exactRect =
+      exactRectAbs === null
+        ? null
+        : {
+            ...exactRectAbs,
+            top: exactRectAbs.top - scrollY,
+          };
+
+    const markerLeft = exactRect
+      ? exactRect.left + Math.min(exactRect.width / 2, 18)
+      : bandLeft + 18;
+    const markerTop = exactRect ? exactRect.top + 4 : bandTop + 10;
+    return {
+      band: {
+        left: bandLeft,
+        top: bandTop,
+        width: bandRight - bandLeft,
+        height: bandBottom - bandTop,
+      },
+      exact: exactRect,
+      markerLeft,
+      markerTop,
+    };
+  }, [
+    activeEvidenceHighlight,
+    canvasSize.height,
+    canvasSize.width,
+    processLayouts,
+    resolveExactHighlightRect,
+    resolveHighlightProcessId,
+    resolveHighlightThreadLayout,
+    scrollY,
+    timeToPixel,
+  ]);
+
+  // Find event at position
+  const findEventAtPosition = useCallback(
+    (x: number, y: number): TraceEvent | null => {
+      const time = pixelToTime(x);
+      for (const layout of processLayouts) {
+        if (layout.collapsed) continue;
+
+        const data = processedData.get(layout.pid);
+        if (!data) continue;
+
+        for (const threadLayout of layout.threadLayouts) {
+          const threadData = data.threads.find((thread) => thread.tid === threadLayout.tid);
+          if (!threadData) continue;
+
+          const flameGraphTop = threadLayout.flameTop - scrollY;
+          const flameGraphBottom = flameGraphTop + threadLayout.flameHeight;
+
+          if (y < flameGraphTop || y >= flameGraphBottom) {
+            continue;
+          }
+
+          const relativeY = y - flameGraphTop;
+          const targetDepth = Math.floor(relativeY / ROW_HEIGHT);
+
+          for (const event of threadData.events) {
+            if (event.depth !== targetDepth) continue;
+
+            const eventStart = event.ts;
+            const eventEnd = event.ts + (event.dur || 0);
+            if (time >= eventStart && time <= eventEnd) {
+              return event;
+            }
+          }
+        }
+      }
+
+      return null;
+    },
+    [pixelToTime, processLayouts, processedData, scrollY]
   );
 
   // Draw the timeline
@@ -381,11 +769,12 @@ export function Timeline({
     ctx.stroke();
 
     // Draw processes
-    let currentY = TIME_RULER_HEIGHT - scrollY;
     let eventColorIndex = 0;
 
-    for (const [pid, process] of processes) {
-      const headerY = currentY;
+    for (const layout of processLayouts) {
+      const process = processes.get(layout.pid);
+      if (!process) continue;
+      const headerY = layout.headerTop - scrollY;
       
       // Draw process header
       if (headerY + PROCESS_HEADER_HEIGHT > TIME_RULER_HEIGHT && headerY < canvasSize.height) {
@@ -398,7 +787,7 @@ export function Timeline({
         // Collapse arrow
         ctx.fillStyle = "#333";
         ctx.font = "12px sans-serif";
-        const isCollapsed = collapsedProcesses.has(pid);
+        const isCollapsed = collapsedProcesses.has(layout.pid);
         ctx.fillText(isCollapsed ? "▸" : "▾", 8, visibleHeaderY + 15);
 
         // Process name
@@ -421,136 +810,165 @@ export function Timeline({
         ctx.stroke();
       }
 
-      currentY += PROCESS_HEADER_HEIGHT;
+      if (layout.collapsed) continue;
 
-      if (collapsedProcesses.has(pid)) continue;
-
-      const data = processedData.get(pid);
+      const data = processedData.get(layout.pid);
       if (!data) continue;
 
-      const flameGraphTop = currentY;
-      const flameGraphHeight = data.maxDepth * ROW_HEIGHT;
+      for (const threadLayout of layout.threadLayouts) {
+        const threadData = data.threads.find((thread) => thread.tid === threadLayout.tid);
+        if (!threadData) continue;
 
-      // Draw flame graph area background
-      ctx.fillStyle = "#fff";
-      ctx.fillRect(THREAD_HEADER_WIDTH, flameGraphTop, canvasSize.width - THREAD_HEADER_WIDTH, flameGraphHeight);
+        const flameGraphTop = threadLayout.flameTop - scrollY;
+        const spikeAreaTop = threadLayout.spikeTop - scrollY;
+        const blockTop = flameGraphTop;
+        const blockBottom = spikeAreaTop + SPIKE_AREA_HEIGHT;
 
-      // Draw left sidebar with process info
-      ctx.fillStyle = "#f8f8f8";
-      ctx.fillRect(0, flameGraphTop, THREAD_HEADER_WIDTH, flameGraphHeight + SPIKE_AREA_HEIGHT);
-
-      // Draw events as flame graph (stacking vertically)
-      for (const event of data.events) {
-        const eventStart = event.ts;
-        const eventEnd = event.ts + (event.dur || 0);
-
-        // Skip events outside visible range
-        if (eventEnd < viewState.startTime || eventStart > viewState.endTime) continue;
-
-        const x1 = Math.max(timeToPixel(eventStart), THREAD_HEADER_WIDTH);
-        const x2 = Math.min(timeToPixel(eventEnd), canvasSize.width);
-        const width = x2 - x1;
-
-        if (width < 0.3) continue;
-
-        const eventY = flameGraphTop + event.depth * ROW_HEIGHT;
-        const eventHeight = ROW_HEIGHT - 1;
-
-        const color = getEventColor(event, eventColorIndex++);
-        const isSelected = selectedEvent?.name === event.name && selectedEvent?.ts === event.ts;
-        const isHovered = hoveredEvent?.name === event.name && hoveredEvent?.ts === event.ts;
-        const matchesSearch = searchQuery && event.name.toLowerCase().includes(searchQuery.toLowerCase());
-
-        // Draw event rectangle
-        ctx.fillStyle = color;
-        ctx.fillRect(x1, eventY, Math.max(width, MIN_EVENT_WIDTH), eventHeight);
-
-        // Draw border
-        ctx.strokeStyle = darkenColor(color, 0.15);
-        ctx.lineWidth = 0.5;
-        ctx.strokeRect(x1, eventY, Math.max(width, MIN_EVENT_WIDTH), eventHeight);
-
-        // Highlight for selection/hover
-        if (isSelected) {
-          ctx.strokeStyle = "#000";
-          ctx.lineWidth = 2;
-          ctx.strokeRect(x1, eventY, Math.max(width, MIN_EVENT_WIDTH), eventHeight);
-        } else if (isHovered) {
-          ctx.strokeStyle = "#666";
-          ctx.lineWidth = 1.5;
-          ctx.strokeRect(x1, eventY, Math.max(width, MIN_EVENT_WIDTH), eventHeight);
+        if (blockBottom < TIME_RULER_HEIGHT || blockTop > canvasSize.height) {
+          continue;
         }
 
-        // Search highlight
-        if (matchesSearch) {
-          ctx.strokeStyle = "#ff0";
-          ctx.lineWidth = 2;
-          ctx.strokeRect(x1 - 1, eventY - 1, width + 2, eventHeight + 2);
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(
+          THREAD_HEADER_WIDTH,
+          flameGraphTop,
+          canvasSize.width - THREAD_HEADER_WIDTH,
+          threadLayout.flameHeight
+        );
+
+        ctx.fillStyle = "#f8f8f8";
+        ctx.fillRect(0, flameGraphTop, THREAD_HEADER_WIDTH, threadLayout.contentHeight);
+
+        ctx.strokeStyle = "#e3e3e3";
+        ctx.beginPath();
+        ctx.moveTo(0, blockTop);
+        ctx.lineTo(canvasSize.width, blockTop);
+        ctx.stroke();
+
+        const isSelectedThread = selectedEvent?.pid === layout.pid && selectedEvent?.tid === threadLayout.tid;
+        if (isSelectedThread) {
+          ctx.fillStyle = "rgba(66, 133, 244, 0.08)";
+          ctx.fillRect(0, flameGraphTop, THREAD_HEADER_WIDTH, threadLayout.contentHeight);
         }
 
-        // Draw event name if wide enough
-        if (width > 20) {
-          ctx.fillStyle = getContrastColor(color);
-          ctx.font = "10px sans-serif";
-          ctx.textAlign = "left";
+        ctx.textAlign = "left";
+        ctx.fillStyle = "#222";
+        ctx.font = "600 11px sans-serif";
+        const threadName = truncateCanvasText(ctx, threadLayout.threadName, THREAD_HEADER_WIDTH - 16);
+        ctx.fillText(threadName, 10, flameGraphTop + 14);
 
-          const textX = x1 + 2;
-          const maxTextWidth = width - 4;
-          let displayName = event.name;
+        ctx.fillStyle = "#666";
+        ctx.font = "10px sans-serif";
+        ctx.fillText(`tid ${threadLayout.tid}`, 10, flameGraphTop + 28);
+        ctx.fillText(
+          `${threadLayout.eventCount} spans · ${threadLayout.spikeCount} spikes`,
+          10,
+          flameGraphTop + 41
+        );
 
-          // Truncate with ellipsis
-          while (ctx.measureText(displayName).width > maxTextWidth && displayName.length > 4) {
-            displayName = displayName.slice(0, -4) + "...";
+        ctx.strokeStyle = "#e6e6e6";
+        ctx.beginPath();
+        ctx.moveTo(THREAD_HEADER_WIDTH - 1, flameGraphTop);
+        ctx.lineTo(THREAD_HEADER_WIDTH - 1, blockBottom);
+        ctx.stroke();
+
+        for (const event of threadData.events) {
+          const eventStart = event.ts;
+          const eventEnd = event.ts + (event.dur || 0);
+
+          if (eventEnd < viewState.startTime || eventStart > viewState.endTime) continue;
+
+          const x1 = Math.max(timeToPixel(eventStart), THREAD_HEADER_WIDTH);
+          const x2 = Math.min(timeToPixel(eventEnd), canvasSize.width);
+          const width = x2 - x1;
+
+          if (width < 0.3) continue;
+
+          const eventY = flameGraphTop + event.depth * ROW_HEIGHT;
+          const eventHeight = ROW_HEIGHT - 1;
+
+          const color = getEventColor(event, eventColorIndex++);
+          const isSelected = selectedEvent?.name === event.name && selectedEvent?.ts === event.ts;
+          const isHovered = hoveredEvent?.name === event.name && hoveredEvent?.ts === event.ts;
+          const matchesSearch = searchQuery && event.name.toLowerCase().includes(searchQuery.toLowerCase());
+
+          ctx.fillStyle = color;
+          ctx.fillRect(x1, eventY, Math.max(width, MIN_EVENT_WIDTH), eventHeight);
+
+          ctx.strokeStyle = darkenColor(color, 0.15);
+          ctx.lineWidth = 0.5;
+          ctx.strokeRect(x1, eventY, Math.max(width, MIN_EVENT_WIDTH), eventHeight);
+
+          if (isSelected) {
+            ctx.strokeStyle = "#000";
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x1, eventY, Math.max(width, MIN_EVENT_WIDTH), eventHeight);
+          } else if (isHovered) {
+            ctx.strokeStyle = "#666";
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(x1, eventY, Math.max(width, MIN_EVENT_WIDTH), eventHeight);
           }
 
-          if (displayName.length > 3) {
-            ctx.fillText(displayName, textX, eventY + 10);
+          if (matchesSearch) {
+            ctx.strokeStyle = "#ff0";
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x1 - 1, eventY - 1, width + 2, eventHeight + 2);
+          }
+
+          if (width > 20) {
+            ctx.fillStyle = getContrastColor(color);
+            ctx.font = "10px sans-serif";
+            ctx.textAlign = "left";
+
+            const textX = x1 + 2;
+            const maxTextWidth = width - 4;
+            const displayName = truncateCanvasText(ctx, event.name, maxTextWidth);
+
+            if (displayName.length > 3) {
+              ctx.fillText(displayName, textX, eventY + 10);
+            }
           }
         }
-      }
 
-      // Draw spike area (instant events and very short events)
-      const spikeAreaTop = flameGraphTop + flameGraphHeight;
-      
-      // Spike area background
-      ctx.fillStyle = "#fafafa";
-      ctx.fillRect(THREAD_HEADER_WIDTH, spikeAreaTop, canvasSize.width - THREAD_HEADER_WIDTH, SPIKE_AREA_HEIGHT);
+        ctx.fillStyle = "#fafafa";
+        ctx.fillRect(
+          THREAD_HEADER_WIDTH,
+          spikeAreaTop,
+          canvasSize.width - THREAD_HEADER_WIDTH,
+          SPIKE_AREA_HEIGHT
+        );
 
-      // Draw spikes
-      for (const event of data.instantEvents) {
-        const x = timeToPixel(event.ts);
-        if (x < THREAD_HEADER_WIDTH || x > canvasSize.width) continue;
+        for (const event of threadData.instantEvents) {
+          const x = timeToPixel(event.ts);
+          if (x < THREAD_HEADER_WIDTH || x > canvasSize.width) continue;
 
-        const color = getEventColor(event, eventColorIndex++);
-        const spikeHeight = getSpikeHeight(event);
-        
-        ctx.strokeStyle = color;
+          const color = getEventColor(event, eventColorIndex++);
+          const spikeHeight = getSpikeHeight(event);
+
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(x, spikeAreaTop + SPIKE_AREA_HEIGHT);
+          ctx.lineTo(x, spikeAreaTop + SPIKE_AREA_HEIGHT - spikeHeight);
+          ctx.stroke();
+        }
+
+        ctx.strokeStyle = "#eee";
         ctx.lineWidth = 1;
+        for (let depth = 0; depth <= threadData.maxDepth; depth += 1) {
+          const y = flameGraphTop + depth * ROW_HEIGHT;
+          ctx.beginPath();
+          ctx.moveTo(THREAD_HEADER_WIDTH, y);
+          ctx.lineTo(canvasSize.width, y);
+          ctx.stroke();
+        }
+
+        ctx.strokeStyle = "#ddd";
         ctx.beginPath();
-        ctx.moveTo(x, spikeAreaTop + SPIKE_AREA_HEIGHT);
-        ctx.lineTo(x, spikeAreaTop + SPIKE_AREA_HEIGHT - spikeHeight);
+        ctx.moveTo(0, spikeAreaTop + SPIKE_AREA_HEIGHT);
+        ctx.lineTo(canvasSize.width, spikeAreaTop + SPIKE_AREA_HEIGHT);
         ctx.stroke();
       }
-
-      // Draw horizontal grid lines between rows
-      ctx.strokeStyle = "#eee";
-      ctx.lineWidth = 1;
-      for (let depth = 0; depth <= data.maxDepth; depth++) {
-        const y = flameGraphTop + depth * ROW_HEIGHT;
-        ctx.beginPath();
-        ctx.moveTo(THREAD_HEADER_WIDTH, y);
-        ctx.lineTo(canvasSize.width, y);
-        ctx.stroke();
-      }
-
-      // Draw bottom border of spike area
-      ctx.strokeStyle = "#ddd";
-      ctx.beginPath();
-      ctx.moveTo(0, spikeAreaTop + SPIKE_AREA_HEIGHT);
-      ctx.lineTo(canvasSize.width, spikeAreaTop + SPIKE_AREA_HEIGHT);
-      ctx.stroke();
-
-      currentY += flameGraphHeight + SPIKE_AREA_HEIGHT + 4;
     }
 
     // Draw vertical grid lines
@@ -617,17 +1035,18 @@ export function Timeline({
     }
   }, [
     canvasSize,
-    processes,
-    processedData,
-    viewState,
-    timeToPixel,
-    selectedEvent,
+    collapsedProcesses,
     hoveredEvent,
-    searchQuery,
-    scrollY,
     isPanning,
     mousePos,
-    collapsedProcesses,
+    processes,
+    processLayouts,
+    processedData,
+    scrollY,
+    searchQuery,
+    selectedEvent,
+    timeToPixel,
+    viewState,
   ]);
 
   // Handle click on process header to toggle collapse
@@ -653,20 +1072,13 @@ export function Timeline({
       const y = e.clientY - rect.top;
 
       // Check if clicking on a process header
-      let currentY = TIME_RULER_HEIGHT - scrollY;
-      for (const [pid] of processes) {
-        if (y >= currentY && y < currentY + PROCESS_HEADER_HEIGHT) {
+      for (const layout of processLayouts) {
+        const headerY = layout.headerTop - scrollY;
+        if (y >= headerY && y < headerY + PROCESS_HEADER_HEIGHT) {
           if (x < 20) {
             // Clicked collapse arrow
-            handleProcessHeaderClick(pid);
+            handleProcessHeaderClick(layout.pid);
             return;
-          }
-        }
-        currentY += PROCESS_HEADER_HEIGHT;
-        if (!collapsedProcesses.has(pid)) {
-          const data = processedData.get(pid);
-          if (data) {
-            currentY += data.maxDepth * ROW_HEIGHT + SPIKE_AREA_HEIGHT + 4;
           }
         }
       }
@@ -680,7 +1092,7 @@ export function Timeline({
         onEventSelect(event);
       }
     },
-    [tool, findEventAtPosition, onEventSelect, processes, scrollY, collapsedProcesses, processedData, handleProcessHeaderClick]
+    [tool, findEventAtPosition, handleProcessHeaderClick, onEventSelect, processLayouts, scrollY]
   );
 
   const handleMouseMove = useCallback(
@@ -698,7 +1110,8 @@ export function Timeline({
         const dy = e.clientY - panStart.y;
 
         const visibleDuration = viewState.endTime - viewState.startTime;
-        const pixelsPerMicrosecond = (canvasSize.width - THREAD_HEADER_WIDTH) / visibleDuration;
+        const drawableWidth = Math.max(canvasSize.width - THREAD_HEADER_WIDTH, 1);
+        const pixelsPerMicrosecond = drawableWidth / Math.max(visibleDuration, 1);
         const timeDelta = -dx / pixelsPerMicrosecond;
 
         onViewStateChange({
@@ -716,7 +1129,17 @@ export function Timeline({
         setHoveredEvent(null);
       }
     },
-    [isPanning, panStart, viewState, onViewStateChange, canvasSize.width, findEventAtPosition, scrollY, totalHeight]
+    [
+      canvasSize.height,
+      canvasSize.width,
+      findEventAtPosition,
+      isPanning,
+      onViewStateChange,
+      panStart,
+      scrollY,
+      totalHeight,
+      viewState,
+    ]
   );
 
   const handleMouseUp = useCallback(() => {
@@ -743,7 +1166,8 @@ export function Timeline({
         const visibleDuration = viewState.endTime - viewState.startTime;
         const newDuration = visibleDuration * zoomFactor;
 
-        const mouseRatio = (x - THREAD_HEADER_WIDTH) / (canvasSize.width - THREAD_HEADER_WIDTH);
+        const drawableWidth = Math.max(canvasSize.width - THREAD_HEADER_WIDTH, 1);
+        const mouseRatio = (x - THREAD_HEADER_WIDTH) / drawableWidth;
         const newStartTime = mouseTime - newDuration * mouseRatio;
         const newEndTime = newStartTime + newDuration;
 
@@ -777,6 +1201,44 @@ export function Timeline({
         onWheel={handleWheel}
         onContextMenu={(e) => e.preventDefault()}
       />
+
+      {highlightOverlayGeometry && activeEvidenceHighlight && (
+        <div
+          className={`pointer-events-none absolute inset-0 transition-opacity duration-700 ${
+            isEvidenceHighlightFading ? "opacity-0" : "opacity-100"
+          }`}
+        >
+          <div
+            className="absolute rounded-xl border border-[#5b95ff] bg-[#5b95ff]/10 shadow-[0_0_0_1px_rgba(66,133,244,0.08)]"
+            style={{
+              left: highlightOverlayGeometry.band.left,
+              top: highlightOverlayGeometry.band.top,
+              width: highlightOverlayGeometry.band.width,
+              height: highlightOverlayGeometry.band.height,
+            }}
+          />
+
+          {highlightOverlayGeometry.exact && (
+            <div
+              className="absolute animate-pulse rounded-md border-2 border-[#1a73e8] bg-white/10 shadow-[0_0_0_3px_rgba(26,115,232,0.18)]"
+              style={{
+                left: highlightOverlayGeometry.exact.left,
+                top: highlightOverlayGeometry.exact.top,
+                width: highlightOverlayGeometry.exact.width,
+                height: highlightOverlayGeometry.exact.height,
+              }}
+            />
+          )}
+
+          <div
+            className="absolute h-3 w-3 rounded-full border-2 border-white bg-[#1a73e8] shadow-[0_0_0_3px_rgba(26,115,232,0.2)]"
+            style={{
+              left: highlightOverlayGeometry.markerLeft - 6,
+              top: highlightOverlayGeometry.markerTop - 6,
+            }}
+          />
+        </div>
+      )}
     </div>
   );
 }
