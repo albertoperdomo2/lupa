@@ -1,8 +1,8 @@
-# lupa
+# 🔎 lupa
 
 Chrome-style trace viewer for exploring flame graphs, asking questions about a trace, and comparing two runs side by side.
 
-![lupa UI](./lupa.png)
+![lupa UI](./assets/lupa.png)
 
 ## Run It
 
