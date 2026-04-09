@@ -86,8 +86,22 @@ interface EventNode {
 
 const LOOP_WINDOW_SIZE = 3;
 
+function hashString(value: string): string {
+  let hash = 2166136261;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(36);
+}
+
 function createId(prefix: string, value: string): string {
-  return `${prefix}:${value.replace(/\s+/g, "_").slice(0, 140)}`;
+  const normalized = value.replace(/\s+/g, "_");
+  const suffix = hashString(value);
+  const head = normalized.slice(0, 120);
+  return `${prefix}:${head}:${suffix}`;
 }
 
 function formatMetricValue(value: number, unit: string): string {
@@ -344,7 +358,7 @@ function buildRegionFromEvent(
 
 function buildThreadTrees(events: IndexedTraceEvent[]): EventNode[] {
   const sortedEvents = events
-    .filter((event) => event.ph === "X" || event.ph === "B")
+    .filter((event) => event.kind === "span")
     .sort((a, b) => {
       if (a.ts !== b.ts) return a.ts - b.ts;
       return b.dur - a.dur;
@@ -562,7 +576,7 @@ function analyzeTrace(comparedTrace: ComparedTraceInput): TraceAnalysis {
     }
 
     const nonSpikeSpanEvents = sortedByTime.filter(
-      (event) => !isSpikeEvent(event) && (event.ph === "X" || event.ph === "B")
+      (event) => !isSpikeEvent(event) && event.kind === "span"
     );
     for (let index = 0; index < nonSpikeSpanEvents.length - 1; index += 1) {
       const current = nonSpikeSpanEvents[index];

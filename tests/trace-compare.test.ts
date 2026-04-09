@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildTraceCompareReport,
   buildTraceCompareReportExport,
   buildTraceNormalizationConfig,
 } from "@/lib/trace-compare";
@@ -8,6 +9,8 @@ import type {
   TraceCompareMetadata,
   TraceCompareReport,
 } from "@/lib/trace-chat";
+import { buildProcessMap, buildTraceIndex, buildTraceSnapshot } from "@/lib/trace-analysis";
+import type { TraceData } from "@/lib/trace-types";
 
 const baseline: TraceCompareMetadata = {
   traceId: "baseline",
@@ -103,5 +106,99 @@ describe("buildTraceCompareReportExport", () => {
     expect(markdown).toContain("# Deep Findings Report");
     expect(markdown).toContain("Candidate spends less time in compute_logits");
     expect(markdown).toContain("Candidate is faster overall.");
+  });
+});
+
+describe("buildTraceCompareReport", () => {
+  it("builds unique finding ids for long loop signatures", () => {
+    const sharedPrefix = "Call CompiledFxGraph fdqwahzw7w5uwj4xx5fob2cu6k4geft3vibwkgzovpirrvbanhdu ";
+    const loopA = `${sharedPrefix}${"a".repeat(140)} tail-one`;
+    const loopB = `${sharedPrefix}${"a".repeat(140)} tail-two`;
+
+    const buildTrace = (loopName: string, traceId: string): {
+      role: "baseline" | "candidate";
+      snapshot: ReturnType<typeof buildTraceSnapshot>;
+      index: NonNullable<ReturnType<typeof buildTraceIndex>>;
+      metadata: TraceCompareMetadata;
+    } => {
+      const traceData: TraceData = {
+        traceEvents: [
+          {
+            name: "process_name",
+            cat: "__metadata",
+            ph: "M",
+            ts: 0,
+            pid: 1,
+            tid: 0,
+            args: { name: "Worker" },
+          },
+          {
+            name: "thread_name",
+            cat: "__metadata",
+            ph: "M",
+            ts: 0,
+            pid: 1,
+            tid: 1,
+            args: { name: "main" },
+          },
+          {
+            name: loopName,
+            cat: "runtime",
+            ph: "X",
+            ts: 0,
+            dur: 3000,
+            pid: 1,
+            tid: 1,
+          },
+          {
+            name: `${traceId}-middle`,
+            cat: "runtime",
+            ph: "X",
+            ts: 3100,
+            dur: 2000,
+            pid: 1,
+            tid: 1,
+          },
+          {
+            name: `${traceId}-tail`,
+            cat: "runtime",
+            ph: "X",
+            ts: 5200,
+            dur: 1800,
+            pid: 1,
+            tid: 1,
+          },
+        ],
+      };
+
+      const processMap = buildProcessMap(traceData);
+      const index = buildTraceIndex(traceData, processMap)!;
+      const snapshot = buildTraceSnapshot(traceData, index, {
+        label: traceId,
+        loadedAt: "2026-04-09T00:00:00.000Z",
+      });
+
+      return {
+        role: traceId === "baseline" ? "baseline" : "candidate",
+        snapshot,
+        index,
+        metadata: {
+          traceId,
+          label: traceId,
+          workloadKind: "unknown",
+        },
+      };
+    };
+
+    const report = buildTraceCompareReport({
+      baselineTrace: buildTrace(loopA, "baseline"),
+      candidateTrace: buildTrace(loopB, "candidate"),
+      normalizationMode: "total",
+    });
+
+    expect(report).not.toBeNull();
+
+    const loopIds = report!.loopFindings.map((finding) => finding.id);
+    expect(new Set(loopIds).size).toBe(loopIds.length);
   });
 });

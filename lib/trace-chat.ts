@@ -1,12 +1,16 @@
 import type {
   TraceData,
   TraceEvent,
+  TraceEventKind,
   ViewState,
 } from "@/lib/trace-types";
 
 export type TraceChatToolName =
   | "search_events"
+  | "list_hotspots"
+  | "list_anomalies"
   | "inspect_event"
+  | "inspect_anomaly"
   | "inspect_current_view"
   | "focus_event"
   | "set_view_range"
@@ -19,6 +23,8 @@ export type TraceChatToolName =
   | "compare_spikes"
   | "compare_hotspots"
   | "compare_call_paths"
+  | "compare_anomalies"
+  | "search_compare_findings"
   | "search_repo_paths"
   | "list_repo_directory"
   | "read_repo_file";
@@ -36,6 +42,8 @@ export interface IndexedTraceEvent {
   tid: number;
   processName: string;
   threadName: string;
+  kind: TraceEventKind;
+  sourcePhases: TraceEvent["ph"][];
   args?: Record<string, unknown>;
   cname?: string;
 }
@@ -52,6 +60,11 @@ export interface TraceEventReference {
   tid: number;
   processName: string;
   threadName: string;
+  kind: TraceEventKind;
+  sourcePhases: TraceEvent["ph"][];
+  selfTime?: number;
+  depth?: number;
+  callPath?: string[];
   cname?: string;
   args?: Record<string, unknown>;
 }
@@ -82,9 +95,106 @@ export interface TraceProcessSummary {
   }>;
 }
 
+export interface TraceThreadSummary {
+  key: string;
+  pid: number;
+  tid: number;
+  processName: string;
+  threadName: string;
+  spanCount: number;
+  totalDuration: number;
+  totalSelfTime: number;
+  sampleEventId: string | null;
+}
+
 export interface TraceCategorySummary {
   name: string;
   count: number;
+}
+
+export interface TraceCallPathSummary {
+  callPath: string;
+  totalSelfTime: number;
+  occurrences: number;
+  sampleEventId: string | null;
+}
+
+export interface TraceKindCounts {
+  span: number;
+  spike: number;
+  counter: number;
+  flow: number;
+  marker: number;
+}
+
+export type TraceAnomalyKind =
+  | "duration_outlier"
+  | "thread_imbalance"
+  | "gap_cluster"
+  | "rare_expensive_path"
+  | "micro_fragmentation"
+  | "phase_shift"
+  | "serialization"
+  | "counter_correlation";
+
+export type TraceAnomalyStatValue = number | string | boolean | null;
+
+export interface TraceAnomalyCounterSignal {
+  name: string;
+  category: string;
+  value: number;
+  medianValue: number | null;
+  ts: number;
+  deltaFromMedian: number | null;
+  deltaRatio: number | null;
+  sampleEventId: string | null;
+}
+
+export interface TraceAnomaly {
+  id: string;
+  fingerprint: string;
+  kind: TraceAnomalyKind;
+  title: string;
+  summary: string;
+  explanation: string;
+  weirdness: number;
+  confidence: number;
+  reasonCodes: string[];
+  startTime: number;
+  endTime: number;
+  duration: number;
+  processName?: string;
+  threadName?: string;
+  sampleEventId: string | null;
+  eventIds: string[];
+  callPath?: string[];
+  relatedCounters: TraceAnomalyCounterSignal[];
+  stats: Record<string, TraceAnomalyStatValue>;
+}
+
+export interface TraceAnomalyKindSummary {
+  kind: TraceAnomalyKind;
+  count: number;
+  maxWeirdness: number;
+  sampleAnomalyId: string | null;
+}
+
+export interface TraceAnomalyInspection {
+  anomaly: TraceAnomaly;
+  sampleEvent: TraceEventReference | null;
+  relatedEvents: TraceEventReference[];
+  nearbyEvents: TraceEventReference[];
+}
+
+export interface TraceAnomalyComparison {
+  fingerprint: string;
+  kind: TraceAnomalyKind;
+  title: string;
+  status: "new" | "resolved" | "regressed" | "improved" | "changed";
+  baseline: TraceAnomaly | null;
+  candidate: TraceAnomaly | null;
+  weirdnessDelta: number | null;
+  confidenceDelta: number | null;
 }
 
 export interface TraceMetricDelta {
@@ -103,6 +213,7 @@ export interface TraceSnapshot {
   eventCount: number;
   processCount: number;
   threadCount: number;
+  countsByKind: TraceKindCounts;
   bounds: {
     startTime: number;
     endTime: number;
@@ -112,6 +223,11 @@ export interface TraceSnapshot {
   categories: string[];
   topCategories: TraceCategorySummary[];
   topHotspots: TraceHotspotSummary[];
+  topSelfTimeHotspots: TraceHotspotSummary[];
+  topCallPaths: TraceCallPathSummary[];
+  topAnomalies: TraceAnomaly[];
+  anomalyKindSummary: TraceAnomalyKindSummary[];
+  topThreads: TraceThreadSummary[];
   topProcesses: TraceProcessSummary[];
 }
 
@@ -128,12 +244,20 @@ export interface ViewportSummary {
   endTime: number;
   duration: number;
   visibleEventCount: number;
+  visibleSpanCount: number;
   visibleSpikeCount: number;
+  visibleCounterCount: number;
+  visibleFlowCount: number;
+  visibleMarkerCount: number;
   selectedEvent: TraceEventReference | null;
   topVisibleHotspots: TraceHotspotSummary[];
+  topVisibleSelfTimeHotspots: TraceHotspotSummary[];
+  topVisibleCallPaths: TraceCallPathSummary[];
   topVisibleSpikeHotspots: TraceHotspotSummary[];
+  visibleAnomalies: TraceAnomaly[];
   longestVisibleEvents: TraceEventReference[];
   sampleVisibleSpikeEvents: TraceEventReference[];
+  visibleThreads: TraceThreadSummary[];
   visibleProcesses: TraceProcessSummary[];
   searchQuery: string;
   searchMatchCount: number;
@@ -143,6 +267,12 @@ export interface ViewportSummary {
 
 export interface EventInspection {
   event: TraceEventReference;
+  parentChain: TraceEventReference[];
+  directChildren: TraceEventReference[];
+  childHotspots: TraceHotspotSummary[];
+  threadCallPath: string[];
+  selfTime: number | null;
+  descendantCount: number;
   previousInThread: TraceEventReference[];
   nextInThread: TraceEventReference[];
   overlappingInThread: TraceEventReference[];
@@ -352,6 +482,7 @@ export interface TraceChatRequest {
   userMessage?: string | null;
   toolOutputs?: TraceChatToolResult[];
   context: TraceChatContext;
+  contextMode?: "full" | "delta";
   screenshotDataUrl?: string | null;
   attachments?: TraceChatAttachment[];
   repoMentions?: GitHubRepoMention[];
@@ -385,10 +516,23 @@ export type TraceChatStreamEvent =
       error: string;
     };
 
+export interface TraceSpanNode {
+  id: string;
+  parentId: string | null;
+  childIds: string[];
+  depth: number;
+  selfTime: number;
+  callPath: string[];
+}
+
 export interface TraceIndex {
   events: IndexedTraceEvent[];
   eventById: Map<string, IndexedTraceEvent>;
   idByEvent: WeakMap<TraceEvent, string>;
+  eventsByThread: Map<string, IndexedTraceEvent[]>;
+  spanNodeById: Map<string, TraceSpanNode>;
+  anomalies: TraceAnomaly[];
+  anomalyById: Map<string, TraceAnomaly>;
 }
 
 export interface BuildViewportSummaryOptions {

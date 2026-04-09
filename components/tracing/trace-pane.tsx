@@ -1,6 +1,6 @@
 "use client";
-
 import type { Process, TraceData, TraceEvent, ViewState } from "@/lib/trace-types";
+import { normalizeTraceEvents } from "@/lib/trace-analysis";
 import { DetailsPanel } from "@/components/tracing/details-panel";
 import { Minimap } from "@/components/tracing/minimap";
 import { SideToolbar } from "@/components/tracing/side-toolbar";
@@ -48,6 +48,10 @@ export function TracePane({
   onAttachSelection,
   evidenceHighlight,
 }: TracePaneProps) {
+  const normalizedEventCount = traceData
+    ? normalizeTraceEvents(traceData).filter((event) => event.__lupa?.kind !== "marker").length
+    : 0;
+
   if (!traceData) {
     return (
       <div className="flex h-full items-center justify-center bg-white text-xs text-[#666]">
@@ -107,7 +111,7 @@ export function TracePane({
       <StatusBar
         viewState={viewState}
         processes={processes}
-        eventCount={traceData.traceEvents.filter((event) => event.ph !== "M").length}
+        eventCount={normalizedEventCount}
         selectedEvent={selectedEvent}
       />
     </div>

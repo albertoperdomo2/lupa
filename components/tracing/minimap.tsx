@@ -1,8 +1,9 @@
 "use client";
 
-import { useRef, useEffect, useCallback, useState } from "react";
+import { useRef, useEffect, useCallback, useMemo, useState } from "react";
 import type { TraceData, ViewState } from "@/lib/trace-types";
 import { getEventColor } from "@/lib/trace-types";
+import { normalizeTraceEvents } from "@/lib/trace-analysis";
 
 interface MinimapProps {
   traceData: TraceData;
@@ -26,6 +27,10 @@ export function Minimap({
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState(0);
   const [dragType, setDragType] = useState<"pan" | "resize-left" | "resize-right" | null>(null);
+  const normalizedEvents = useMemo(
+    () => normalizeTraceEvents(traceData).filter((event) => event.__lupa?.kind === "span"),
+    [traceData]
+  );
 
   // Resize observer
   useEffect(() => {
@@ -76,16 +81,14 @@ export function Minimap({
     ctx.fillRect(0, 0, canvasWidth, MINIMAP_HEIGHT);
 
     // Draw events as density bars
-    const events = traceData.traceEvents.filter(e => e.ph === "X" || e.ph === "B");
+    const events = normalizedEvents;
     let eventIndex = 0;
-    
+
     for (const event of events) {
-      if (event.ph !== "X" && event.ph !== "B") continue;
-      
       const x1 = timeToPixel(event.ts);
       const x2 = timeToPixel(event.ts + (event.dur || 1000));
       const width = Math.max(x2 - x1, 1);
-      
+
       const color = getEventColor(event, eventIndex++);
       ctx.fillStyle = color;
       ctx.fillRect(x1, 3, width, MINIMAP_HEIGHT - 6);
@@ -105,7 +108,7 @@ export function Minimap({
     ctx.strokeStyle = "#333";
     ctx.lineWidth = 1;
     ctx.strokeRect(viewStart + 0.5, 0.5, viewWidth - 1, MINIMAP_HEIGHT - 1);
-  }, [traceData, viewState, timeBounds, canvasWidth, timeToPixel]);
+  }, [normalizedEvents, viewState, timeBounds, canvasWidth, timeToPixel]);
 
   // Handle mouse events
   const handleMouseDown = useCallback(

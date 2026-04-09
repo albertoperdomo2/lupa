@@ -31,9 +31,12 @@ import {
   buildTraceIndex,
   buildTraceSnapshot,
   buildViewportSummary,
+  inspectTraceAnomaly,
   inspectTraceEvent,
+  normalizeTraceEvents,
   searchTraceEvents,
 } from "@/lib/trace-analysis";
+import { compareTraceAnomalies } from "@/lib/trace-anomalies";
 import {
   clearPersistedTraceSession,
   loadPersistedTraceSession,
@@ -181,7 +184,7 @@ function findMatchingTraceEvent(
   if (!eventRef) return null;
 
   return (
-    traceData.traceEvents.find(
+    normalizeTraceEvents(traceData).find(
       (event) =>
         event.name === eventRef.name &&
         event.ts === eventRef.ts &&
@@ -325,15 +328,15 @@ function sanitizeMessageForPersistence(message: ChatPanelMessage): ChatPanelMess
 }
 
 function buildTimeBounds(traceData: TraceData | null): { min: number; max: number } {
-  if (!traceData || traceData.traceEvents.length === 0) {
+  const events = normalizeTraceEvents(traceData);
+  if (events.length === 0) {
     return { min: 0, max: 1_000_000 };
   }
 
   let min = Number.POSITIVE_INFINITY;
   let max = Number.NEGATIVE_INFINITY;
 
-  for (const event of traceData.traceEvents) {
-    if (event.ph === "M") continue;
+  for (const event of events) {
     min = Math.min(min, event.ts);
     max = Math.max(max, event.ts + (event.dur ?? 0));
   }
@@ -1763,6 +1766,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         userMessage?: string | null;
         toolOutputs?: TraceChatToolResult[];
         context: TraceChatContext;
+        contextMode?: "full" | "delta";
         screenshotDataUrl?: string | null;
         attachments?: TraceChatAttachment[];
         repoMentions?: GitHubRepoMention[];
@@ -1992,6 +1996,58 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         return attachedRepos.find((repo) => repo.id === repoId) ?? null;
       };
 
+      const searchDeepCompareFindings = (query: string, limit: number) => {
+        if (!deepCompareReport) return [];
+
+        const normalizedQuery = query.trim().toLowerCase();
+        if (!normalizedQuery) return [];
+
+        const dedupedFindings = new Map<string, (typeof deepCompareReport.findings)[number]>();
+        for (const finding of [
+          ...deepCompareReport.findings,
+          ...deepCompareReport.hotspotFindings,
+          ...deepCompareReport.spikeFindings,
+          ...deepCompareReport.callPathFindings,
+          ...deepCompareReport.loopFindings,
+        ]) {
+          dedupedFindings.set(finding.id, finding);
+        }
+
+        return [...dedupedFindings.values()]
+          .map((finding) => {
+            const searchable = [
+              finding.title,
+              finding.summary,
+              finding.explanation,
+              finding.kind,
+              ...finding.labels,
+            ]
+              .join(" ")
+              .toLowerCase();
+
+            if (!searchable.includes(normalizedQuery)) return null;
+
+            let score = 0;
+            if (finding.title.toLowerCase() === normalizedQuery) score += 10;
+            if (finding.title.toLowerCase().includes(normalizedQuery)) score += 5;
+            if (finding.labels.some((label) => label.toLowerCase() === normalizedQuery)) {
+              score += 3;
+            }
+
+            return {
+              finding,
+              score,
+            };
+          })
+          .filter((entry): entry is { finding: (typeof deepCompareReport.findings)[number]; score: number } => Boolean(entry))
+          .sort((left, right) => {
+            if (right.score !== left.score) return right.score - left.score;
+            return right.finding.priority - left.finding.priority;
+          })
+          .slice(0, limit)
+          .map(({ finding }) => finding);
+      };
+
       switch (toolCall.name) {
         case "search_events": {
           const target = getTarget(toolCall.arguments.trace_role);
@@ -2030,6 +2086,165 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
           };
         }
 
+        case "list_hotspots": {
+          const target = getTarget(toolCall.arguments.trace_role);
+          const scope =
+            toolCall.arguments.scope === "view" ? "view" : "trace";
+          const metric =
+            typeof toolCall.arguments.metric === "string"
+              ? toolCall.arguments.metric
+              : "inclusive_time";
+          const limit = clampNumber(toolCall.arguments.limit, 1, 12, 6);
+          const viewSummary =
+            scope === "view" && target.traceIndex
+              ? buildViewportSummary(target.traceIndex, {
+                  viewState: target.runtimeState.viewState,
+                  selectedEventId: resolveTraceEventId(
+                    target.traceIndex,
+                    target.runtimeState.selectedEvent
+                  ),
+                  searchQuery,
+                })
+              : null;
+
+          if (scope === "trace" && !target.traceSnapshot) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant requested trace hotspots before any trace was loaded.",
+              output: {
+                success: false,
+                error: `No ${target.label} is currently loaded.`,
+              },
+            };
+          }
+
+          if (scope === "view" && !viewSummary) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant requested viewport hotspots before any trace was loaded.",
+              output: {
+                success: false,
+                error: `No ${target.label} is currently loaded.`,
+              },
+            };
+          }
+
+          let items: unknown[] = [];
+
+          if (scope === "trace") {
+            switch (metric) {
+              case "inclusive_time":
+                items = target.traceSnapshot!.topHotspots.slice(0, limit);
+                break;
+              case "self_time":
+                items = target.traceSnapshot!.topSelfTimeHotspots.slice(0, limit);
+                break;
+              case "call_path":
+                items = target.traceSnapshot!.topCallPaths.slice(0, limit);
+                break;
+              case "thread":
+                items = target.traceSnapshot!.topThreads.slice(0, limit);
+                break;
+              default:
+                return {
+                  runtime: nextRuntime,
+                  logMessage: "Assistant requested an unsupported whole-trace hotspot metric.",
+                  output: {
+                    success: false,
+                    error: `Metric "${metric}" is only available on the current viewport.`,
+                  },
+                };
+            }
+          } else {
+            switch (metric) {
+              case "inclusive_time":
+                items = viewSummary!.topVisibleHotspots.slice(0, limit);
+                break;
+              case "self_time":
+                items = viewSummary!.topVisibleSelfTimeHotspots.slice(0, limit);
+                break;
+              case "call_path":
+                items = viewSummary!.topVisibleCallPaths.slice(0, limit);
+                break;
+              case "thread":
+                items = viewSummary!.visibleThreads.slice(0, limit);
+                break;
+              case "spike":
+                items = viewSummary!.topVisibleSpikeHotspots.slice(0, limit);
+                break;
+              default:
+                items = [];
+                break;
+            }
+          }
+
+          return {
+            runtime: nextRuntime,
+            logMessage: `Assistant listed ${scope === "trace" ? "whole-trace" : "viewport"} ${metric.replaceAll("_", " ")} hotspots for the ${target.label}.`,
+            output: {
+              traceRole: target.targetKey,
+              scope,
+              metric,
+              items,
+            },
+          };
+        }
+
+        case "list_anomalies": {
+          const target = getTarget(toolCall.arguments.trace_role);
+          if (!target.traceIndex) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant requested anomalies before any trace was loaded.",
+              output: {
+                success: false,
+                error: `No ${target.label} is currently loaded.`,
+              },
+            };
+          }
+
+          const scope = toolCall.arguments.scope === "view" ? "view" : "trace";
+          const kind =
+            typeof toolCall.arguments.kind === "string" &&
+            toolCall.arguments.kind.trim() &&
+            toolCall.arguments.kind !== "all"
+              ? toolCall.arguments.kind.trim()
+              : null;
+          const limit = clampNumber(toolCall.arguments.limit, 1, 12, 6);
+          const viewSummary =
+            scope === "view"
+              ? buildViewportSummary(target.traceIndex, {
+                  viewState: target.runtimeState.viewState,
+                  selectedEventId: resolveTraceEventId(
+                    target.traceIndex,
+                    target.runtimeState.selectedEvent
+                  ),
+                  searchQuery,
+                })
+              : null;
+
+          const anomalies = (
+            scope === "view"
+              ? viewSummary?.visibleAnomalies ?? []
+              : target.traceIndex.anomalies
+          )
+            .filter((anomaly) => (kind ? anomaly.kind === kind : true))
+            .slice(0, limit);
+
+          return {
+            runtime: nextRuntime,
+            logMessage: anomalies.length
+              ? `Assistant listed ${scope === "view" ? "viewport" : "whole-trace"} anomalies for the ${target.label}.`
+              : `Assistant checked the ${target.label} for ${scope === "view" ? "viewport" : "trace"} anomalies but found none that match.`,
+            output: {
+              traceRole: target.targetKey,
+              scope,
+              kind: kind ?? "all",
+              items: anomalies,
+            },
+          };
+        }
+
         case "inspect_event": {
           const target = getTarget(toolCall.arguments.trace_role);
           if (!target.traceIndex) {
@@ -2058,6 +2273,38 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               inspection ?? {
                 success: false,
                 error: `Event "${eventId}" was not found in the ${target.label}.`,
+            },
+          };
+        }
+
+        case "inspect_anomaly": {
+          const target = getTarget(toolCall.arguments.trace_role);
+          if (!target.traceIndex) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant requested an anomaly inspection before any trace was loaded.",
+              output: {
+                success: false,
+                error: `No ${target.label} is currently loaded.`,
+              },
+            };
+          }
+
+          const anomalyId =
+            typeof toolCall.arguments.anomaly_id === "string"
+              ? toolCall.arguments.anomaly_id
+              : "";
+          const inspection = inspectTraceAnomaly(target.traceIndex, anomalyId);
+
+          return {
+            runtime: nextRuntime,
+            logMessage: inspection
+              ? `Assistant inspected the anomaly "${inspection.anomaly.title}" on the ${target.label}.`
+              : `Assistant tried to inspect an anomaly that is no longer available in the ${target.label}.`,
+            output:
+              inspection ?? {
+                success: false,
+                error: `Anomaly "${anomalyId}" was not found in the ${target.label}.`,
               },
           };
         }
@@ -2092,9 +2339,19 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               traceRole: target.targetKey,
               ...viewSummary,
               topVisibleHotspots: viewSummary.topVisibleHotspots.slice(0, limit),
+              topVisibleSelfTimeHotspots: viewSummary.topVisibleSelfTimeHotspots.slice(
+                0,
+                limit
+              ),
+              topVisibleCallPaths: viewSummary.topVisibleCallPaths.slice(
+                0,
+                Math.min(limit, 8)
+              ),
               topVisibleSpikeHotspots: viewSummary.topVisibleSpikeHotspots.slice(0, limit),
+              visibleAnomalies: viewSummary.visibleAnomalies.slice(0, limit),
               longestVisibleEvents: viewSummary.longestVisibleEvents.slice(0, limit),
               sampleVisibleSpikeEvents: viewSummary.sampleVisibleSpikeEvents.slice(0, limit),
+              visibleThreads: viewSummary.visibleThreads.slice(0, Math.min(limit, 6)),
               visibleProcesses: viewSummary.visibleProcesses.slice(0, Math.min(limit, 6)),
               searchMatches: viewSummary.searchMatches.slice(0, limit),
             },
@@ -2337,6 +2594,14 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               winner: deepCompareReport.winner,
               summaryMetrics: deepCompareReport.summaryMetrics,
               findings: deepCompareReport.findings.slice(0, limit),
+              anomalyComparisons:
+                baselineTraceIndex && candidateTraceIndex
+                  ? compareTraceAnomalies(
+                      baselineTraceIndex.anomalies,
+                      candidateTraceIndex.anomalies,
+                      limit
+                    )
+                  : [],
               caveats: deepCompareReport.caveats,
               topChangedLoops: deepCompareReport.topChangedLoops.slice(0, limit),
             },
@@ -2545,6 +2810,77 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
           };
         }
 
+        case "compare_anomalies": {
+          const limit = clampNumber(toolCall.arguments.limit, 1, 12, 6);
+          if (
+            nextRuntime.mode !== "deep" ||
+            !baselineTraceIndex ||
+            !candidateTraceIndex
+          ) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to compare anomalies before Deep Mode was ready.",
+              output: {
+                success: false,
+                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+              },
+            };
+          }
+
+          const kind =
+            typeof toolCall.arguments.kind === "string" &&
+            toolCall.arguments.kind.trim() &&
+            toolCall.arguments.kind !== "all"
+              ? toolCall.arguments.kind.trim()
+              : null;
+          const comparisons = compareTraceAnomalies(
+            baselineTraceIndex.anomalies,
+            candidateTraceIndex.anomalies,
+            24
+          ).filter((comparison) => (kind ? comparison.kind === kind : true));
+
+          return {
+            runtime: nextRuntime,
+            logMessage: comparisons.length
+              ? "Assistant compared anomaly fingerprints between the baseline and candidate traces."
+              : "Assistant compared anomalies between the baseline and candidate traces but found no matching changes.",
+            output: {
+              kind: kind ?? "all",
+              comparisons: comparisons.slice(0, limit),
+            },
+          };
+        }
+
+        case "search_compare_findings": {
+          const limit = clampNumber(toolCall.arguments.limit, 1, 12, 6);
+          if (nextRuntime.mode !== "deep" || !deepCompareReport) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to search Deep Mode findings before Deep Mode was ready.",
+              output: {
+                success: false,
+                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+              },
+            };
+          }
+
+          const query =
+            typeof toolCall.arguments.query === "string" ? toolCall.arguments.query : "";
+          const findings = searchDeepCompareFindings(query, limit);
+
+          return {
+            runtime: nextRuntime,
+            logMessage: findings.length
+              ? `Assistant searched Deep Mode findings for "${query}" and found ${findings.length} matches.`
+              : `Assistant searched Deep Mode findings for "${query}" but found no matches.`,
+            output: {
+              query,
+              matchCount: findings.length,
+              findings,
+            },
+          };
+        }
+
         case "search_repo_paths": {
           const repoId =
             typeof toolCall.arguments.repo_id === "string"
@@ -2699,6 +3035,8 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
       let pendingRequestAttachments =
         outgoingAttachments.length > 0 ? outgoingAttachments : undefined;
       let pendingRepoMentions = nextAttachedRepos.length > 0 ? nextAttachedRepos : undefined;
+      let pendingContextMode: "full" | "delta" = "full";
+      let shouldAttachScreenshot = true;
       const runtime: ToolExecutionRuntime = {
         mode,
         single: {
@@ -2719,7 +3057,9 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         for (let step = 0; step < TOOL_STEP_LIMIT; step += 1) {
           let streamedAssistantId: string | null = null;
           let streamedAssistantText = "";
-          const screenshotDataUrl = await captureCurrentScreenshot();
+          const screenshotDataUrl = shouldAttachScreenshot
+            ? await captureCurrentScreenshot()
+            : null;
 
           const response = await requestTraceChat(
             {
@@ -2727,6 +3067,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               userMessage: pendingUserMessage,
               toolOutputs: pendingToolOutputs,
               context: buildRuntimeChatContext(runtime),
+              contextMode: pendingContextMode,
               screenshotDataUrl,
               attachments: pendingRequestAttachments,
               repoMentions: pendingRepoMentions,
@@ -2798,6 +3139,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
           }
 
           const nextToolOutputs: TraceChatToolResult[] = [];
+          let nextStepNeedsScreenshot = false;
 
           for (const toolCall of response.toolCalls) {
             const execution = await executeToolCall(toolCall, runtime);
@@ -2805,6 +3147,17 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
             runtime.single = execution.runtime.single;
             runtime.baseline = execution.runtime.baseline;
             runtime.candidate = execution.runtime.candidate;
+
+            if (
+              toolCall.name === "focus_event" ||
+              toolCall.name === "set_view_range" ||
+              toolCall.name === "fit_to_trace" ||
+              toolCall.name === "clear_selection" ||
+              toolCall.name === "focus_compare_region"
+            ) {
+              nextStepNeedsScreenshot = true;
+            }
+
             nextToolOutputs.push({
               callId: toolCall.callId,
               name: toolCall.name,
@@ -2824,6 +3177,8 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
           pendingToolOutputs = nextToolOutputs;
           pendingRequestAttachments = undefined;
           pendingRepoMentions = nextAttachedRepos.length > 0 ? nextAttachedRepos : undefined;
+          pendingContextMode = "delta";
+          shouldAttachScreenshot = nextStepNeedsScreenshot;
         }
 
         setChatErrorMessage("The assistant hit the current tool-step limit before finishing.");
@@ -2998,7 +3353,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         <StatusBar
           viewState={singleTrace.viewState}
           processes={singleProcesses}
-          eventCount={singleTrace.traceData.traceEvents.filter((event) => event.ph !== "M").length}
+          eventCount={singleTraceSnapshot?.eventCount ?? 0}
           selectedEvent={singleTrace.selectedEvent}
         />
       )}

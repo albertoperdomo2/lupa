@@ -4,6 +4,7 @@ import { useRef, useEffect, useCallback, useState, useMemo } from "react";
 import type { TraceEvent, Process, ViewState } from "@/lib/trace-types";
 import {
   formatTimeShort,
+  getTraceEventKind,
   getEventColor,
   isSpikeEvent,
   SPIKE_EVENT_DURATION_THRESHOLD_US,
@@ -293,7 +294,7 @@ export function Timeline({
         .sort((left, right) => left.tid - right.tid)
         .map((thread) => {
           const spanEvents = thread.events.filter(
-            (event) => !isSpikeEvent(event) && (event.ph === "X" || event.ph === "B")
+            (event) => getTraceEventKind(event) === "span"
           );
           const instantEvents = thread.events.filter((event) => isSpikeEvent(event));
           const nested = buildNestedEvents(spanEvents);

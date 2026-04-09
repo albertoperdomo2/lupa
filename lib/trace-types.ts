@@ -1,3 +1,5 @@
+export type TraceEventKind = "span" | "spike" | "counter" | "flow" | "marker";
+
 export interface TraceEvent {
   name: string;
   cat: string;
@@ -8,6 +10,11 @@ export interface TraceEvent {
   tid: number;
   args?: Record<string, unknown>;
   cname?: string;
+  __lupa?: {
+    id: string;
+    kind: TraceEventKind;
+    sourcePhases: TraceEvent["ph"][];
+  };
 }
 
 export interface TraceData {
@@ -132,12 +139,44 @@ export function formatTimeShort(microseconds: number): string {
   }
 }
 
-export function isSpikeEvent(event: Pick<TraceEvent, "ph" | "dur">): boolean {
+export function getTraceEventKind(event: Pick<TraceEvent, "ph" | "dur" | "__lupa">): TraceEventKind {
+  if (event.__lupa?.kind) {
+    return event.__lupa.kind;
+  }
+
+  if (event.ph === "i" || event.ph === "I" || event.ph === "R") {
+    return "spike";
+  }
+
+  if (event.ph === "X") {
+    return (event.dur ?? 0) < SPIKE_EVENT_DURATION_THRESHOLD_US ? "spike" : "span";
+  }
+
+  if (event.ph === "C") {
+    return "counter";
+  }
+
+  if (event.ph === "s" || event.ph === "t" || event.ph === "f") {
+    return "flow";
+  }
+
+  if (event.ph === "B") {
+    return (event.dur ?? 0) > 0 ? "span" : "marker";
+  }
+
+  return "marker";
+}
+
+export function isSpikeEvent(event: Pick<TraceEvent, "ph" | "dur" | "__lupa">): boolean {
+  if (event.__lupa?.kind) {
+    return event.__lupa.kind === "spike";
+  }
+
   if (event.ph === "i" || event.ph === "I" || event.ph === "R") {
     return true;
   }
 
-  if (event.ph === "X" || event.ph === "B") {
+  if (event.ph === "X") {
     return (event.dur ?? 0) < SPIKE_EVENT_DURATION_THRESHOLD_US;
   }
 

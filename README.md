@@ -40,6 +40,8 @@ Loaded traces persist locally on your device and are restored after reload until
 - Compare `baseline` and `candidate` traces in `Deep Mode`.
 - Focus findings directly in both flame graphs.
 
+This tool uses a normalized trace-analysis path so the viewer and Trace Agent reason over the same event model. It reconstructs `B/E` spans before analysis, separates spans from spikes and counters in viewport summaries, and carries parent-chain, child, self-time, and call-path context into agent inspections so answers stay tied to visible evidence. It also ranks deterministic anomalies such as duration outliers, thread imbalance, repeated idle gaps, serialization, bursty micro-fragmentation, phase shifts, and counter-correlated regressions, which helps it surface weird bottlenecks instead of only restating the biggest hotspots.
+
 ## Local Development
 
 ```bash

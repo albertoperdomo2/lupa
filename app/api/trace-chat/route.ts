@@ -35,10 +35,16 @@ Style:
 
 Tool behavior:
 - Prefer inspecting with tools over guessing when a question is specific.
+- Use list_hotspots when the user asks broad questions about what is hot, dominant, or expensive.
+- Use list_anomalies when the user asks about weird, suspicious, imbalanced, bursty, serialized, or non-obvious bottlenecks.
 - Use search_events to find candidate spans before calling focus_event or inspect_event.
+- inspect_event returns parent-chain, child, self-time, and call-path context for one event.
+- inspect_anomaly returns the exact anomaly window, linked events, and any correlated counters for one anomaly.
 - Use compare_with_previous when the user asks what changed after a new trace is loaded.
 - If Deep Mode is enabled, use run_deep_compare first for pairwise analysis, then inspect_compare_finding or focus_compare_region for evidence.
-- In Deep Mode, search_events, inspect_event, inspect_current_view, focus_event, set_view_range, fit_to_trace, and clear_selection may target either the baseline or candidate trace via trace_role.
+- Use compare_anomalies when the user asks what suspicious patterns were introduced, resolved, or became stranger between baseline and candidate.
+- Use search_compare_findings if the relevant Deep Mode finding is not already in the top returned list.
+- In Deep Mode, search_events, list_hotspots, list_anomalies, inspect_event, inspect_anomaly, inspect_current_view, focus_event, set_view_range, fit_to_trace, and clear_selection may target either the baseline or candidate trace via trace_role.
 - When a tool accepts trace_role, always provide it explicitly.
 - If one or more GitHub repos are attached, you may inspect them with repo tools before answering.
 - Use search_repo_paths or list_repo_directory to find candidate files, then use read_repo_file for exact code inspection.
@@ -87,6 +93,71 @@ const TOOL_DEFINITIONS = [
   },
   {
     type: "function",
+    name: "list_hotspots",
+    description:
+      "List the strongest hotspots, self-time hotspots, call paths, or hot threads from the current trace or viewport.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        scope: {
+          type: "string",
+          enum: ["trace", "view"],
+          description: "Whether to inspect the whole loaded trace summary or only the current viewport.",
+        },
+        metric: {
+          type: "string",
+          enum: ["inclusive_time", "self_time", "call_path", "thread", "spike"],
+          description: "The kind of hotspot summary to return.",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of rows to return.",
+        },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: "Target trace. Use candidate when Deep Mode is active and you do not need the baseline.",
+        },
+      },
+      required: ["scope", "metric", "limit", "trace_role"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_anomalies",
+    description:
+      "List the strongest deterministic anomalies in the whole trace or current viewport, optionally filtered by anomaly kind.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        scope: {
+          type: "string",
+          enum: ["trace", "view"],
+          description: "Whether to inspect the whole loaded trace or only the current viewport window.",
+        },
+        kind: {
+          type: "string",
+          description: 'Optional anomaly kind filter such as "duration_outlier" or "serialization". Use "all" for no filter.',
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of anomalies to return.",
+        },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: "Target trace. Use candidate when Deep Mode is active and you do not need the baseline.",
+        },
+      },
+      required: ["scope", "kind", "limit", "trace_role"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
     name: "inspect_event",
     description:
       "Inspect one current-trace event in detail, including nearby events on the same thread.",
@@ -105,6 +176,29 @@ const TOOL_DEFINITIONS = [
         },
       },
       required: ["event_id", "trace_role"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "inspect_anomaly",
+    description:
+      "Inspect one anomaly in detail, including the anomaly window, related trace events, and nearby evidence.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        anomaly_id: {
+          type: "string",
+          description: "Opaque anomaly id returned by list_anomalies or present in app context.",
+        },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: "Target trace. Use candidate when Deep Mode is active and you do not need the baseline.",
+        },
+      },
+      required: ["anomaly_id", "trace_role"],
       additionalProperties: false,
     },
   },
@@ -367,6 +461,50 @@ const TOOL_DEFINITIONS = [
   },
   {
     type: "function",
+    name: "search_compare_findings",
+    description:
+      "Search the full Deep Mode findings set by title, label, or explanation text.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Case-insensitive search string for finding title, labels, or explanation.",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of findings to return.",
+        },
+      },
+      required: ["query", "limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "compare_anomalies",
+    description:
+      "Compare anomaly fingerprints between the baseline and candidate traces to find suspicious patterns that appeared, disappeared, or changed severity.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        kind: {
+          type: "string",
+          description: 'Optional anomaly kind filter such as "serialization" or "gap_cluster". Use "all" for no filter.',
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of anomaly comparisons to return.",
+        },
+      },
+      required: ["kind", "limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
     name: "search_repo_paths",
     description:
       "Search attached GitHub repo file paths by substring so you can find candidate files to read.",
@@ -437,11 +575,93 @@ const TOOL_DEFINITIONS = [
   },
 ] as const;
 
-function buildContextText(body: TraceChatRequest): string {
+function buildFullContextText(body: TraceChatRequest): string {
   return [
     "APP_CONTEXT_UPDATE",
     "Use this latest app state as the source of truth for the current UI state and preserved trace history.",
     JSON.stringify(body.context, null, 2),
+    body.screenshotDataUrl
+      ? "A screenshot of the current visible flame graph viewport is attached in this same message."
+      : "No automatic flame graph viewport screenshot is attached in this turn.",
+  ].join("\n\n");
+}
+
+function buildDeltaContextText(body: TraceChatRequest): string {
+  const context = body.context;
+  const currentTrace = context.currentTrace;
+  const currentView = context.currentView;
+  const deepCompare = context.deepCompare;
+
+  return [
+    "APP_CONTEXT_UPDATE",
+    "Use this latest compact app-state update as the source of truth for the current UI state.",
+    JSON.stringify(
+      {
+        currentTrace: currentTrace
+          ? {
+              id: currentTrace.id,
+              label: currentTrace.label,
+              eventCount: currentTrace.eventCount,
+              bounds: currentTrace.bounds,
+              countsByKind: currentTrace.countsByKind,
+              topAnomalies: currentTrace.topAnomalies.slice(0, 3),
+              anomalyKindSummary: currentTrace.anomalyKindSummary.slice(0, 4),
+            }
+          : null,
+        currentView: currentView
+          ? {
+              startTime: currentView.startTime,
+              endTime: currentView.endTime,
+              duration: currentView.duration,
+              visibleEventCount: currentView.visibleEventCount,
+              visibleSpanCount: currentView.visibleSpanCount,
+              visibleSpikeCount: currentView.visibleSpikeCount,
+              selectedEvent: currentView.selectedEvent,
+              visibleAnomalies: currentView.visibleAnomalies.slice(0, 3),
+            }
+          : null,
+        comparisonToPrevious: context.comparisonToPrevious
+          ? {
+              available: context.comparisonToPrevious.available,
+              previousLabel: context.comparisonToPrevious.previousLabel,
+              currentLabel: context.comparisonToPrevious.currentLabel,
+              durationDelta: context.comparisonToPrevious.durationDelta,
+              eventCountDelta: context.comparisonToPrevious.eventCountDelta,
+            }
+          : null,
+        deepCompare: deepCompare
+          ? {
+              enabled: deepCompare.enabled,
+              normalizationMode: deepCompare.normalizationMode,
+              report: deepCompare.report
+                ? {
+                    id: deepCompare.report.id,
+                    headline: deepCompare.report.headline,
+                    winner: deepCompare.report.winner,
+                  }
+                : null,
+              baselineView: deepCompare.baselineView
+                ? {
+                    startTime: deepCompare.baselineView.startTime,
+                    endTime: deepCompare.baselineView.endTime,
+                    selectedEvent: deepCompare.baselineView.selectedEvent,
+                    visibleAnomalies: deepCompare.baselineView.visibleAnomalies.slice(0, 2),
+                  }
+                : null,
+              candidateView: deepCompare.candidateView
+                ? {
+                    startTime: deepCompare.candidateView.startTime,
+                    endTime: deepCompare.candidateView.endTime,
+                    selectedEvent: deepCompare.candidateView.selectedEvent,
+                    visibleAnomalies: deepCompare.candidateView.visibleAnomalies.slice(0, 2),
+                  }
+                : null,
+            }
+          : null,
+      },
+      null,
+      2
+    ),
     body.screenshotDataUrl
       ? "A screenshot of the current visible flame graph viewport is attached in this same message."
       : "No automatic flame graph viewport screenshot is attached in this turn.",
@@ -563,7 +783,10 @@ async function buildInput(body: TraceChatRequest) {
     content: [
       {
         type: "input_text",
-        text: buildContextText(body),
+        text:
+          body.contextMode === "delta"
+            ? buildDeltaContextText(body)
+            : buildFullContextText(body),
       },
       ...(body.screenshotDataUrl
         ? [
