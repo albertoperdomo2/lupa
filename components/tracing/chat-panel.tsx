@@ -83,18 +83,18 @@ export function ChatPanel({
     }
 
     if (!hasTrace) {
-      return "Load a trace and ask what the flame graph means, or ask how to use the viewer.";
+      return "Load a run and ask what the flame graph means, or ask how to use the viewer.";
     }
 
     if (mode === "deep" && (baselineTraceLabel || candidateTraceLabel)) {
-      return `Deep compare: ${baselineTraceLabel ?? "baseline"} vs ${candidateTraceLabel ?? "candidate"}.`;
+      return `Deep compare: ${baselineTraceLabel ?? "baseline run"} vs ${candidateTraceLabel ?? "candidate run"}.`;
     }
 
     if (previousTraceLabel) {
-      return `Current trace: ${currentTraceLabel ?? "loaded trace"}. Previous trace kept for comparison: ${previousTraceLabel}.`;
+      return `Current run: ${currentTraceLabel ?? "loaded run"}. Previous run kept for comparison: ${previousTraceLabel}.`;
     }
 
-    return `Current trace: ${currentTraceLabel ?? "loaded trace"}.`;
+    return `Current run: ${currentTraceLabel ?? "loaded run"}.`;
   }, [
     baselineTraceLabel,
     candidateTraceLabel,
@@ -306,12 +306,12 @@ function EmptyPrompt({
       ? [
           "Why is the widest section in the current view expensive?",
           "Find the hottest llama or torch span and zoom to it.",
-          "Compare this trace with the previous one and tell me what changed.",
+          "Compare this run with the previous one and tell me what changed.",
         ]
       : [
           "Explain what a flame graph shows.",
-          "Tell me how to inspect a slow section once I load a trace.",
-          "After I load a new trace, compare it with the previous one.",
+          "Tell me how to inspect a slow section once I load a run.",
+          "After I load a new run, compare it with the previous one.",
         ]
     : ["Add OPENAI_API_KEY to .env and restart the app."];
 

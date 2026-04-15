@@ -17,10 +17,11 @@ export function EmptyState({ onLoadFile }: EmptyStateProps) {
           </div>
           <h2 className="mb-3 text-2xl font-semibold text-[#333]">lupa</h2>
           <p className="mb-8 text-sm leading-relaxed text-[#666]">
-            Load a Chrome trace JSON file to visualize performance data. You can record traces
+            Load one or more Chrome trace JSON files to inspect a full run. You can record traces
             using Chrome DevTools Performance panel,{" "}
             <code className="rounded bg-[#f0f0f0] px-1 text-xs text-[#333]">chrome://tracing</code>,
-            or via command line.
+            or via command line. If a run spans multiple pods or processes, load all of its trace
+            files together.
           </p>
           <div className="mb-8 flex flex-col items-center gap-3">
             <Button
@@ -28,7 +29,7 @@ export function EmptyState({ onLoadFile }: EmptyStateProps) {
               className="h-10 gap-2 bg-[#4285f4] px-6 text-white hover:bg-[#3367d6]"
             >
               <Upload className="h-4 w-4" />
-              Load Trace File
+              Load Run Files
             </Button>
           </div>
 

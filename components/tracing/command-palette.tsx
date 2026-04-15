@@ -98,11 +98,11 @@ export function CommandPalette({
         <CommandGroup heading="Open">
           <CommandItem onSelect={() => runAndClose(onLoadSingle, onOpenChange)}>
             <Upload />
-            <span>Load trace</span>
+            <span>Load run</span>
           </CommandItem>
           <CommandItem onSelect={() => runAndClose(() => onSetMode("single"), onOpenChange)}>
             <FileJson />
-            <span>Switch to single trace mode</span>
+            <span>Switch to single run mode</span>
           </CommandItem>
           <CommandItem onSelect={() => runAndClose(() => onSetMode("deep"), onOpenChange)}>
             <GitCompareArrows />
@@ -112,11 +112,11 @@ export function CommandPalette({
             <>
               <CommandItem onSelect={() => runAndClose(onLoadBaseline, onOpenChange)}>
                 <Upload />
-                <span>Load baseline trace</span>
+                <span>Load baseline run</span>
               </CommandItem>
               <CommandItem onSelect={() => runAndClose(onLoadCandidate, onOpenChange)}>
                 <Upload />
-                <span>Load candidate trace</span>
+                <span>Load candidate run</span>
               </CommandItem>
             </>
           )}

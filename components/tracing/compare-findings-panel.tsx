@@ -174,8 +174,8 @@ export function CompareFindingsPanel({
           </div>
           <div className="text-sm font-semibold text-[#333]">Deep Mode</div>
           <div className="mt-2 text-xs leading-5 text-[#666]">
-            Load a baseline and candidate trace, set any normalization metadata you have,
-            and the compare engine will rank the most meaningful deltas.
+            Load a baseline and candidate run, set any normalization metadata you have, and
+            the compare engine will rank the most meaningful deltas.
           </div>
         </div>
       </div>

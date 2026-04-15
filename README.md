@@ -31,16 +31,16 @@ lupa stop
 lupa uninstall
 ```
 
-Loaded traces persist locally on your device and are restored after reload until you clear them from the app.
+Loaded runs persist locally on your device and are restored after reload until you clear them from the app.
 
 ## What It Does
 
-- Load a trace JSON file and inspect it as an interactive flame graph.
-- Ask `Trace Agent` technical questions about the current trace.
-- Compare `baseline` and `candidate` traces in `Deep Mode`.
+- Load one or more trace JSON files as a single run and inspect them as an interactive flame graph.
+- Ask `Trace Agent` technical questions about the current run.
+- Compare `baseline` and `candidate` runs in `Deep Mode`.
 - Focus findings directly in both flame graphs.
 
-This tool uses a normalized trace-analysis path so the viewer and Trace Agent reason over the same event model. It reconstructs `B/E` spans before analysis, separates spans from spikes and counters in viewport summaries, and carries parent-chain, child, self-time, and call-path context into agent inspections so answers stay tied to visible evidence. It also ranks deterministic anomalies such as duration outliers, thread imbalance, repeated idle gaps, serialization, bursty micro-fragmentation, phase shifts, and counter-correlated regressions, which helps it surface weird bottlenecks instead of only restating the biggest hotspots.
+This tool uses a normalized trace-analysis path so the viewer and Trace Agent reason over the same event model. A run can contain multiple trace files, which makes it possible to inspect multi-pod or multi-process workloads as one workload sample instead of forcing file-by-file analysis. It reconstructs `B/E` spans before analysis, separates spans from spikes and counters in viewport summaries, and carries parent-chain, child, self-time, and call-path context into agent inspections so answers stay tied to visible evidence. It also ranks deterministic anomalies such as duration outliers, thread imbalance, repeated idle gaps, serialization, bursty micro-fragmentation, phase shifts, and counter-correlated regressions, which helps it surface weird bottlenecks instead of only restating the biggest hotspots.
 
 ## Local Development
 
@@ -64,5 +64,5 @@ OPENAI_MODEL=gpt-5.4
 - The viewer works without the agent.
 - Trace Agent requires a valid OpenAI API key.
 - Deep Mode assumes comparable runs of the same workload and environment.
-- Full traces persist in IndexedDB. Chat history persists in local storage.
+- Full runs persist in IndexedDB. Chat history persists in local storage.
 - Use `Clear Saved Traces` when you want a clean local session.

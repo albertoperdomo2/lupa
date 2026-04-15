@@ -17,8 +17,8 @@ const TRACE_CHAT_INSTRUCTIONS = `
 You are Trace Agent, a trace-analysis agent embedded inside a Chrome-style flame graph viewer.
 
 Your job:
-- Explain what is happening in the current trace or flame graph.
-- Compare the current trace with the previous trace when relevant.
+- Explain what is happening in the current run or flame graph.
+- Compare the current run with the previous run when relevant.
 - Use the actual viewport screenshot, any manually attached screenshots, and structured app context together.
 - If the current view is too broad, use tools to focus or inspect before answering.
 - Never invent trace details that are not supported by the screenshot, the context JSON, or tool outputs.
@@ -44,7 +44,7 @@ Tool behavior:
 - If Deep Mode is enabled, use run_deep_compare first for pairwise analysis, then inspect_compare_finding or focus_compare_region for evidence.
 - Use compare_anomalies when the user asks what suspicious patterns were introduced, resolved, or became stranger between baseline and candidate.
 - Use search_compare_findings if the relevant Deep Mode finding is not already in the top returned list.
-- In Deep Mode, search_events, list_hotspots, list_anomalies, inspect_event, inspect_anomaly, inspect_current_view, focus_event, set_view_range, fit_to_trace, and clear_selection may target either the baseline or candidate trace via trace_role.
+- In Deep Mode, search_events, list_hotspots, list_anomalies, inspect_event, inspect_anomaly, inspect_current_view, focus_event, set_view_range, fit_to_trace, and clear_selection may target either the baseline or candidate run via trace_role.
 - When a tool accepts trace_role, always provide it explicitly.
 - If one or more GitHub repos are attached, you may inspect them with repo tools before answering.
 - Use search_repo_paths or list_repo_directory to find candidate files, then use read_repo_file for exact code inspection.
@@ -58,9 +58,10 @@ Context rules:
 - Messages that begin with APP_ATTACHMENT are frozen user-selected attachments from the UI and remain valid even if the live trace later changes.
 - Messages that begin with APP_REPO_ATTACHMENT are authoritative GitHub repo snapshots currently attached to the conversation.
 - If older app context conflicts with newer app context, trust the newest app context.
-- If Deep Mode is enabled, the deepCompare report is the authoritative deterministic diff between baseline and candidate traces.
+- If Deep Mode is enabled, the deepCompare report is the authoritative deterministic diff between baseline and candidate runs.
+- A loaded run may contain multiple trace files merged into one run-level view; use source counts and source labels from app context when they matter.
 - When you refer to a specific span, include its process or thread when that helps disambiguate it.
-- When comparing traces, be explicit about whether the evidence comes from the current trace, the preserved previous trace summary, or both.
+- When comparing runs, be explicit about whether the evidence comes from the current run, the preserved previous run summary, or both.
 `.trim();
 
 const TOOL_DEFINITIONS = [
@@ -68,7 +69,7 @@ const TOOL_DEFINITIONS = [
     type: "function",
     name: "search_events",
     description:
-      "Search the current trace for events by name, category, process, or thread name and return matching event ids.",
+      "Search the current run for events by name, category, process, or thread name and return matching event ids.",
     strict: true,
     parameters: {
       type: "object",
@@ -95,7 +96,7 @@ const TOOL_DEFINITIONS = [
     type: "function",
     name: "list_hotspots",
     description:
-      "List the strongest hotspots, self-time hotspots, call paths, or hot threads from the current trace or viewport.",
+      "List the strongest hotspots, self-time hotspots, call paths, or hot threads from the current run or viewport.",
     strict: true,
     parameters: {
       type: "object",
@@ -103,7 +104,7 @@ const TOOL_DEFINITIONS = [
         scope: {
           type: "string",
           enum: ["trace", "view"],
-          description: "Whether to inspect the whole loaded trace summary or only the current viewport.",
+          description: "Whether to inspect the whole loaded run summary or only the current viewport.",
         },
         metric: {
           type: "string",
@@ -136,7 +137,7 @@ const TOOL_DEFINITIONS = [
         scope: {
           type: "string",
           enum: ["trace", "view"],
-          description: "Whether to inspect the whole loaded trace or only the current viewport window.",
+          description: "Whether to inspect the whole loaded run or only the current viewport window.",
         },
         kind: {
           type: "string",
@@ -228,7 +229,7 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     name: "focus_event",
-    description: "Select an event in the current trace and zoom the viewport around it.",
+    description: "Select an event in the current run and zoom the viewport around it.",
     strict: true,
     parameters: {
       type: "object",
@@ -325,7 +326,7 @@ const TOOL_DEFINITIONS = [
     type: "function",
     name: "compare_with_previous",
     description:
-      "Return a structured comparison between the current trace and the previous preserved trace summary.",
+      "Return a structured comparison between the current run and the previous preserved run summary.",
     strict: true,
     parameters: {
       type: "object",
@@ -343,7 +344,7 @@ const TOOL_DEFINITIONS = [
     type: "function",
     name: "run_deep_compare",
     description:
-      "Return the deterministic Deep Mode compare report between the loaded baseline and candidate traces.",
+      "Return the deterministic Deep Mode compare report between the loaded baseline and candidate runs.",
     strict: true,
     parameters: {
       type: "object",
@@ -379,7 +380,7 @@ const TOOL_DEFINITIONS = [
     type: "function",
     name: "focus_compare_region",
     description:
-      "Focus evidence regions from a Deep Mode compare finding or region id in the baseline and candidate traces.",
+      "Focus evidence regions from a Deep Mode compare finding or region id in the baseline and candidate runs.",
     strict: true,
     parameters: {
       type: "object",
@@ -485,7 +486,7 @@ const TOOL_DEFINITIONS = [
     type: "function",
     name: "compare_anomalies",
     description:
-      "Compare anomaly fingerprints between the baseline and candidate traces to find suspicious patterns that appeared, disappeared, or changed severity.",
+      "Compare anomaly fingerprints between the baseline and candidate runs to find suspicious patterns that appeared, disappeared, or changed severity.",
     strict: true,
     parameters: {
       type: "object",
@@ -601,6 +602,8 @@ function buildDeltaContextText(body: TraceChatRequest): string {
           ? {
               id: currentTrace.id,
               label: currentTrace.label,
+              sourceCount: currentTrace.sourceCount,
+              sources: currentTrace.sources.slice(0, 4),
               eventCount: currentTrace.eventCount,
               bounds: currentTrace.bounds,
               countsByKind: currentTrace.countsByKind,

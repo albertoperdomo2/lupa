@@ -48,6 +48,13 @@ import {
   type RestoredTracePaneRecord,
 } from "@/lib/trace-persistence";
 import {
+  appendTraceRunSource,
+  createTraceRunBuilder,
+  finalizeTraceRunBuilder,
+  type TraceRunInput,
+  type TraceRunSourceSummary,
+} from "@/lib/trace-run";
+import {
   buildTraceCompareReport,
   buildTraceCompareReportExport,
   findCompareFinding,
@@ -104,6 +111,7 @@ interface TracePaneState {
   traceData: TraceData | null;
   traceLoadedAt: string | null;
   filename?: string;
+  sources: TraceRunSourceSummary[];
   selectedEvent: TraceEvent | null;
   tool: "select" | "pan";
   viewState: ViewState;
@@ -119,6 +127,17 @@ interface CaptureRect {
   top: number;
   width: number;
   height: number;
+}
+
+interface RunLoadProgress {
+  target: LoadTarget;
+  stage: "reading" | "parsing" | "combining";
+  fileCount: number;
+  completedFiles: number;
+  currentFileIndex: number;
+  currentFileName: string | null;
+  totalBytes: number;
+  loadedBytes: number;
 }
 
 interface PersistedChatSession {
@@ -150,6 +169,7 @@ function createEmptyTracePaneState(): TracePaneState {
     traceData: null,
     traceLoadedAt: null,
     filename: undefined,
+    sources: [],
     selectedEvent: null,
     tool: "select",
     viewState: createDefaultViewState(),
@@ -205,6 +225,7 @@ function buildPersistedTracePanePayload(
     traceData: paneState.traceData,
     traceLoadedAt: paneState.traceLoadedAt,
     filename: paneState.filename,
+    sources: paneState.sources,
   };
 }
 
@@ -226,6 +247,7 @@ function restoreTracePaneState(record: RestoredTracePaneRecord | null): TracePan
     traceData: record.payload.traceData,
     traceLoadedAt: record.payload.traceLoadedAt,
     filename: record.payload.filename,
+    sources: record.payload.sources ?? [],
     selectedEvent: findMatchingTraceEvent(record.payload.traceData, record.state.selectedEvent),
     tool: record.state.tool,
     viewState: record.state.viewState,
@@ -249,6 +271,94 @@ function waitForFrames(count = 2): Promise<void> {
     }
 
     nextFrame(count);
+  });
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function getLoadTargetLabel(target: LoadTarget): string {
+  if (target === "baseline") return "baseline run";
+  if (target === "candidate") return "candidate run";
+  return "current run";
+}
+
+function getRunLoadProgressPercent(progress: RunLoadProgress): number {
+  const readFraction =
+    progress.totalBytes > 0
+      ? Math.min(1, progress.loadedBytes / progress.totalBytes)
+      : progress.fileCount > 0
+        ? progress.completedFiles / progress.fileCount
+        : 0;
+
+  if (progress.stage === "combining") {
+    return Math.max(readFraction, 0.98);
+  }
+
+  if (progress.stage === "parsing") {
+    return Math.max(readFraction, 0.95);
+  }
+
+  return readFraction;
+}
+
+function getRunLoadProgressMessage(progress: RunLoadProgress): string {
+  if (progress.stage === "combining") {
+    return `Combining ${progress.fileCount} trace files into one run`;
+  }
+
+  const fileNumber = Math.min(progress.currentFileIndex + 1, progress.fileCount);
+  const filename = progress.currentFileName ?? `trace-${fileNumber}`;
+
+  if (progress.stage === "parsing") {
+    return `Parsing file ${fileNumber}/${progress.fileCount}: ${filename}`;
+  }
+
+  return `Reading file ${fileNumber}/${progress.fileCount}: ${filename}`;
+}
+
+function parseTraceFileContent(content: string, filename: string): TraceRunInput {
+  const data = JSON.parse(content) as TraceData | TraceData["traceEvents"];
+
+  if (Array.isArray(data)) {
+    return {
+      traceData: { traceEvents: data },
+      filename,
+    };
+  }
+
+  if (data && typeof data === "object" && Array.isArray(data.traceEvents)) {
+    return {
+      traceData: data,
+      filename,
+    };
+  }
+
+  throw new Error("Invalid trace format. Expected Chrome trace JSON format.");
+}
+
+function readTraceFileText(
+  file: File,
+  onProgress?: (loadedBytes: number) => void
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      onProgress?.(event.loaded);
+    };
+
+    reader.onload = (loadEvent) => {
+      resolve((loadEvent.target?.result as string) ?? "");
+    };
+
+    reader.onerror = () => reject(new Error(`Failed to read ${file.name}.`));
+    reader.readAsText(file);
   });
 }
 
@@ -507,6 +617,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
   const [isCaptureMode, setIsCaptureMode] = useState(false);
   const [captureOrigin, setCaptureOrigin] = useState<CapturePoint | null>(null);
   const [captureCurrent, setCaptureCurrent] = useState<CapturePoint | null>(null);
+  const [runLoadProgress, setRunLoadProgress] = useState<RunLoadProgress | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const loadTargetRef = useRef<LoadTarget>("single");
   const workspaceRef = useRef<HTMLDivElement | null>(null);
@@ -601,22 +712,31 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
     if (!singleTrace.traceData || !singleTraceIndex) return null;
 
     return buildTraceSnapshot(singleTrace.traceData, singleTraceIndex, {
-      label: singleTrace.filename ?? "Current trace",
+      label: singleTrace.filename ?? "Current run",
       filename: singleTrace.filename,
       loadedAt: singleTrace.traceLoadedAt ?? undefined,
+      sources: singleTrace.sources,
     });
-  }, [singleTrace.filename, singleTrace.traceData, singleTrace.traceLoadedAt, singleTraceIndex]);
+  }, [
+    singleTrace.filename,
+    singleTrace.sources,
+    singleTrace.traceData,
+    singleTrace.traceLoadedAt,
+    singleTraceIndex,
+  ]);
 
   const baselineTraceSnapshot = useMemo(() => {
     if (!baselineTrace.traceData || !baselineTraceIndex) return null;
 
     return buildTraceSnapshot(baselineTrace.traceData, baselineTraceIndex, {
-      label: baselineTrace.filename ?? "Baseline trace",
+      label: baselineTrace.filename ?? "Baseline run",
       filename: baselineTrace.filename,
       loadedAt: baselineTrace.traceLoadedAt ?? undefined,
+      sources: baselineTrace.sources,
     });
   }, [
     baselineTrace.filename,
+    baselineTrace.sources,
     baselineTrace.traceData,
     baselineTrace.traceLoadedAt,
     baselineTraceIndex,
@@ -626,12 +746,14 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
     if (!candidateTrace.traceData || !candidateTraceIndex) return null;
 
     return buildTraceSnapshot(candidateTrace.traceData, candidateTraceIndex, {
-      label: candidateTrace.filename ?? "Candidate trace",
+      label: candidateTrace.filename ?? "Candidate run",
       filename: candidateTrace.filename,
       loadedAt: candidateTrace.traceLoadedAt ?? undefined,
+      sources: candidateTrace.sources,
     });
   }, [
     candidateTrace.filename,
+    candidateTrace.sources,
     candidateTrace.traceData,
     candidateTrace.traceLoadedAt,
     candidateTraceIndex,
@@ -935,17 +1057,27 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
     fileInputRef.current?.click();
   }, []);
 
-  const loadTraceData = useCallback(
-    (target: LoadTarget, data: TraceData, name?: string) => {
+  const loadTraceRun = useCallback(
+    (
+      target: LoadTarget,
+      combinedRun: ReturnType<typeof finalizeTraceRunBuilder>
+    ) => {
+      if (!combinedRun) return;
+
       const loadedAt = new Date().toISOString();
-      const nextViewState = buildDefaultViewState(data);
+      const nextViewState = buildDefaultViewState(combinedRun.traceData);
+      const sourceCount = combinedRun.sources.length;
       const label =
-        name ??
+        combinedRun.displayName ??
         (target === "baseline"
-          ? "Baseline trace"
+          ? "Baseline run"
           : target === "candidate"
-            ? "Candidate trace"
-            : "Current trace");
+            ? "Candidate run"
+            : "Current run");
+      const loadSummary =
+        sourceCount === 1
+          ? label
+          : `${label} (${sourceCount} trace files)`;
 
       setIsCaptureMode(false);
       setCaptureOrigin(null);
@@ -961,17 +1093,18 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
 
         setSingleTrace((previousState) => ({
           ...previousState,
-          traceData: data,
+          traceData: combinedRun.traceData,
           traceLoadedAt: loadedAt,
-          filename: name,
+          filename: label,
+          sources: combinedRun.sources,
           selectedEvent: null,
           viewState: nextViewState,
         }));
         setSingleTimelineApi(null);
         addToolMessage(
           preservedPrevious
-            ? `Loaded ${label}. Previous trace "${preservedPrevious.label}" is still available for comparison.`
-            : `Loaded ${label}.`
+            ? `Loaded ${loadSummary}. Previous run "${preservedPrevious.label}" is still available for comparison.`
+            : `Loaded ${loadSummary}.`
         );
         return;
       }
@@ -982,9 +1115,10 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         setBaselineEvidenceHighlight(null);
         setBaselineTrace((previousState) => ({
           ...previousState,
-          traceData: data,
+          traceData: combinedRun.traceData,
           traceLoadedAt: loadedAt,
-          filename: name,
+          filename: label,
+          sources: combinedRun.sources,
           selectedEvent: null,
           viewState: nextViewState,
         }));
@@ -994,16 +1128,17 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
           traceId: `${loadedAt}:${label}`,
           label,
         }));
-        addToolMessage(`Loaded ${label} as the Deep Mode baseline.`);
+        addToolMessage(`Loaded ${loadSummary} as the Deep Mode baseline.`);
         return;
       }
 
       setCandidateEvidenceHighlight(null);
       setCandidateTrace((previousState) => ({
         ...previousState,
-        traceData: data,
+        traceData: combinedRun.traceData,
         traceLoadedAt: loadedAt,
-        filename: name,
+        filename: label,
+        sources: combinedRun.sources,
         selectedEvent: null,
         viewState: nextViewState,
       }));
@@ -1013,40 +1148,115 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         traceId: `${loadedAt}:${label}`,
         label,
       }));
-      addToolMessage(`Loaded ${label} as the Deep Mode candidate.`);
+      addToolMessage(`Loaded ${loadSummary} as the Deep Mode candidate.`);
     },
     [addToolMessage, previousTraceSnapshot, singleTraceSnapshot]
   );
 
   const handleFileChange = useCallback(
-    (event: React.ChangeEvent<HTMLInputElement>) => {
-      const file = event.target.files?.[0];
-      if (!file) return;
-
+    async (event: React.ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(event.target.files ?? []);
+      if (files.length === 0) return;
       const target = loadTargetRef.current;
-      const reader = new FileReader();
-
-      reader.onload = (loadEvent) => {
-        try {
-          const content = loadEvent.target?.result as string;
-          const data = JSON.parse(content) as TraceData;
-
-          if (Array.isArray(data)) {
-            loadTraceData(target, { traceEvents: data }, file.name);
-          } else if (data.traceEvents) {
-            loadTraceData(target, data, file.name);
-          } else {
-            alert("Invalid trace format. Expected Chrome trace JSON format.");
-          }
-        } catch {
-          alert("Failed to parse trace file. Make sure it's valid JSON.");
-        }
-      };
-
-      reader.readAsText(file);
+      const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
       event.target.value = "";
+
+      try {
+        const builder = createTraceRunBuilder();
+        let completedBytes = 0;
+
+        setRunLoadProgress({
+          target,
+          stage: "reading",
+          fileCount: files.length,
+          completedFiles: 0,
+          currentFileIndex: 0,
+          currentFileName: files[0]?.name ?? null,
+          totalBytes,
+          loadedBytes: 0,
+        });
+        await waitForFrames(1);
+
+        for (const [index, file] of files.entries()) {
+          setRunLoadProgress({
+            target,
+            stage: "reading",
+            fileCount: files.length,
+            completedFiles: index,
+            currentFileIndex: index,
+            currentFileName: file.name,
+            totalBytes,
+            loadedBytes: completedBytes,
+          });
+          await waitForFrames(1);
+
+          const content = await readTraceFileText(file, (loadedBytes) => {
+            setRunLoadProgress((previousState) =>
+              previousState
+                ? {
+                    ...previousState,
+                    stage: "reading",
+                    currentFileIndex: index,
+                    currentFileName: file.name,
+                    loadedBytes: completedBytes + loadedBytes,
+                  }
+                : previousState
+            );
+          });
+
+          setRunLoadProgress({
+            target,
+            stage: "parsing",
+            fileCount: files.length,
+            completedFiles: index,
+            currentFileIndex: index,
+            currentFileName: file.name,
+            totalBytes,
+            loadedBytes: completedBytes + file.size,
+          });
+          await waitForFrames(1);
+
+          let input: TraceRunInput;
+          try {
+            input = parseTraceFileContent(content, file.name);
+          } catch {
+            throw new Error(`Failed to parse ${file.name}. Make sure it is valid JSON.`);
+          }
+
+          appendTraceRunSource(builder, input, index);
+          completedBytes += file.size;
+        }
+
+        setRunLoadProgress({
+          target,
+          stage: "combining",
+          fileCount: files.length,
+          completedFiles: files.length,
+          currentFileIndex: files.length - 1,
+          currentFileName: null,
+          totalBytes,
+          loadedBytes: completedBytes,
+        });
+        await waitForFrames(1);
+
+        loadTraceRun(
+          target,
+          finalizeTraceRunBuilder(
+            builder,
+            target === "baseline"
+              ? "Baseline run"
+              : target === "candidate"
+                ? "Candidate run"
+                : "Current run"
+          )
+        );
+        setRunLoadProgress(null);
+      } catch (error) {
+        setRunLoadProgress(null);
+        alert(error instanceof Error ? error.message : "Failed to parse trace files.");
+      }
     },
-    [loadTraceData]
+    [loadTraceRun]
   );
 
   const cancelAreaCapture = useCallback(() => {
@@ -1883,7 +2093,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         if (targetKey === "single") {
           return {
             targetKey,
-            label: "current trace",
+            label: "current run",
             traceIndex: singleTraceIndex,
             traceSnapshot: singleTraceSnapshot,
             runtimeState: nextRuntime.single,
@@ -1903,7 +2113,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         if (targetKey === "baseline") {
           return {
             targetKey,
-            label: "baseline trace",
+            label: "baseline run",
             traceIndex: baselineTraceIndex,
             traceSnapshot: baselineTraceSnapshot,
             runtimeState: nextRuntime.baseline,
@@ -1922,7 +2132,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
 
         return {
           targetKey,
-          label: "candidate trace",
+          label: "candidate run",
           traceIndex: candidateTraceIndex,
           traceSnapshot: candidateTraceSnapshot,
           runtimeState: nextRuntime.candidate,
@@ -2553,8 +2763,8 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
             runtime: nextRuntime,
             logMessage: comparison?.available
               ? nextRuntime.mode === "deep"
-                ? "Assistant compared the baseline and candidate trace summaries."
-                : "Assistant compared the current trace with the preserved previous trace."
+                ? "Assistant compared the baseline and candidate run summaries."
+                : "Assistant compared the current run with the preserved previous run."
               : "Assistant checked for comparison data but none is available yet.",
             output:
               comparison != null
@@ -2576,10 +2786,10 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
           if (nextRuntime.mode !== "deep" || !deepCompareReport) {
             return {
               runtime: nextRuntime,
-              logMessage: "Assistant tried to run Deep Mode before both comparison traces were ready.",
+              logMessage: "Assistant tried to run Deep Mode before both comparison runs were ready.",
               output: {
                 success: false,
-                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+                error: "Deep Mode is not available until both baseline and candidate runs are loaded.",
               },
             };
           }
@@ -2615,7 +2825,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               logMessage: "Assistant tried to inspect a Deep Mode finding before the report was available.",
               output: {
                 success: false,
-                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+                error: "Deep Mode is not available until both baseline and candidate runs are loaded.",
               },
             };
           }
@@ -2646,7 +2856,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               logMessage: "Assistant tried to focus Deep Mode evidence before the compare report was available.",
               output: {
                 success: false,
-                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+                error: "Deep Mode is not available until both baseline and candidate runs are loaded.",
               },
             };
           }
@@ -2716,10 +2926,10 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
           if (focusedCount === 0) {
             return {
               runtime: nextRuntime,
-              logMessage: "Assistant found compare evidence, but the linked traces are no longer loaded.",
+              logMessage: "Assistant found compare evidence, but the linked runs are no longer loaded.",
               output: {
                 success: false,
-                error: "The linked compare evidence is no longer available in the loaded traces.",
+                error: "The linked compare evidence is no longer available in the loaded runs.",
               },
             };
           }
@@ -2745,7 +2955,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               logMessage: "Assistant tried to compare spikes before Deep Mode was ready.",
               output: {
                 success: false,
-                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+                error: "Deep Mode is not available until both baseline and candidate runs are loaded.",
               },
             };
           }
@@ -2769,7 +2979,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               logMessage: "Assistant tried to compare hotspots before Deep Mode was ready.",
               output: {
                 success: false,
-                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+                error: "Deep Mode is not available until both baseline and candidate runs are loaded.",
               },
             };
           }
@@ -2793,7 +3003,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               logMessage: "Assistant tried to compare call paths before Deep Mode was ready.",
               output: {
                 success: false,
-                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+                error: "Deep Mode is not available until both baseline and candidate runs are loaded.",
               },
             };
           }
@@ -2822,7 +3032,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               logMessage: "Assistant tried to compare anomalies before Deep Mode was ready.",
               output: {
                 success: false,
-                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+                error: "Deep Mode is not available until both baseline and candidate runs are loaded.",
               },
             };
           }
@@ -2842,8 +3052,8 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
           return {
             runtime: nextRuntime,
             logMessage: comparisons.length
-              ? "Assistant compared anomaly fingerprints between the baseline and candidate traces."
-              : "Assistant compared anomalies between the baseline and candidate traces but found no matching changes.",
+              ? "Assistant compared anomaly fingerprints between the baseline and candidate runs."
+              : "Assistant compared anomalies between the baseline and candidate runs but found no matching changes.",
             output: {
               kind: kind ?? "all",
               comparisons: comparisons.slice(0, limit),
@@ -2859,7 +3069,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               logMessage: "Assistant tried to search Deep Mode findings before Deep Mode was ready.",
               output: {
                 success: false,
-                error: "Deep Mode is not available until both baseline and candidate traces are loaded.",
+                error: "Deep Mode is not available until both baseline and candidate runs are loaded.",
               },
             };
           }
@@ -3273,6 +3483,44 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
       </div>
     ) : null;
 
+  const renderRunLoadOverlay = () => {
+    if (!runLoadProgress) return null;
+
+    const progressPercent = Math.round(getRunLoadProgressPercent(runLoadProgress) * 100);
+    const byteProgress =
+      runLoadProgress.totalBytes > 0
+        ? `${formatBytes(runLoadProgress.loadedBytes)} / ${formatBytes(runLoadProgress.totalBytes)}`
+        : `${runLoadProgress.completedFiles} / ${runLoadProgress.fileCount} files`;
+
+    return (
+      <div className="pointer-events-none fixed inset-x-0 top-16 z-50 flex justify-center px-4">
+        <div className="w-full max-w-xl rounded-md border border-[#d8d8d8] bg-white/96 px-4 py-3 shadow-lg backdrop-blur">
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#5f5f5f]">
+                Loading {getLoadTargetLabel(runLoadProgress.target)}
+              </div>
+              <div className="mt-1 truncate text-sm font-medium text-[#1f1f1f]">
+                {getRunLoadProgressMessage(runLoadProgress)}
+              </div>
+              <div className="mt-1 text-xs text-[#666]">{byteProgress}</div>
+            </div>
+            <div className="shrink-0 text-sm font-semibold tabular-nums text-[#1f1f1f]">
+              {progressPercent}%
+            </div>
+          </div>
+
+          <div className="mt-3 h-2 overflow-hidden rounded-full bg-[#e8eefc]">
+            <div
+              className="h-full rounded-full bg-[#2f6df6] transition-[width] duration-150 ease-out"
+              style={{ width: `${progressPercent}%` }}
+            />
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   const renderSingleWorkspace = () => (
     <div className="flex h-full flex-col bg-white">
       <div ref={workspaceRef} className="relative flex-1 overflow-hidden">
@@ -3515,6 +3763,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         ref={fileInputRef}
         type="file"
         accept=".json,.json.gz"
+        multiple
         onChange={handleFileChange}
         className="hidden"
       />
@@ -3615,6 +3864,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         hasSavedTraces={hasSavedTraces}
         onClearSavedTraces={handleClearSavedTraces}
       />
+      {renderRunLoadOverlay()}
     </div>
   );
 }

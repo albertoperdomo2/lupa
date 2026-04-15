@@ -4,6 +4,7 @@ import type {
   TraceEventKind,
   ViewState,
 } from "@/lib/trace-types";
+import type { TraceRunSourceSummary } from "@/lib/trace-run";
 
 export type TraceChatToolName =
   | "search_events"
@@ -210,6 +211,8 @@ export interface TraceSnapshot {
   label: string;
   filename?: string;
   loadedAt: string;
+  sourceCount: number;
+  sources: TraceRunSourceSummary[];
   eventCount: number;
   processCount: number;
   threadCount: number;

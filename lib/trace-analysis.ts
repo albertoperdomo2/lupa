@@ -32,6 +32,7 @@ import type {
   VisibleBucketSummary,
   ViewportSummary,
 } from "@/lib/trace-chat";
+import type { TraceRunSourceSummary } from "@/lib/trace-run";
 
 interface RawThreadEvent {
   event: TraceEvent;
@@ -244,7 +245,13 @@ export function normalizeTraceEvents(traceData: TraceData | null): TraceEvent[] 
     ]);
   });
 
-  const normalized = [...eventsByThread.values()].flatMap(normalizeRawThreadEvents);
+  const normalized: TraceEvent[] = [];
+  for (const threadEvents of eventsByThread.values()) {
+    const threadNormalized = normalizeRawThreadEvents(threadEvents);
+    for (const event of threadNormalized) {
+      normalized.push(event);
+    }
+  }
   normalized.sort(compareTraceEvents);
   return normalized;
 }
@@ -958,6 +965,7 @@ export function buildTraceSnapshot(
     label?: string;
     filename?: string;
     loadedAt?: string;
+    sources?: TraceRunSourceSummary[];
   } = {}
 ): TraceSnapshot {
   const events = traceIndex.events;
@@ -966,6 +974,7 @@ export function buildTraceSnapshot(
   const topCategories = countCategories(nonMarkerEvents);
   const loadedAt = options.loadedAt ?? new Date().toISOString();
   const label = options.label ?? options.filename ?? "Untitled trace";
+  const sources = options.sources ?? [];
   const boundsSource = spanEvents.length > 0 ? spanEvents : nonMarkerEvents;
   const spanEntries = spanEvents.map((event) => ({
     event,
@@ -981,6 +990,8 @@ export function buildTraceSnapshot(
     label,
     filename: options.filename,
     loadedAt,
+    sourceCount: Math.max(sources.length, 1),
+    sources,
     eventCount: nonMarkerEvents.length,
     processCount: new Set(nonMarkerEvents.map((event) => event.pid)).size,
     threadCount: new Set(nonMarkerEvents.map((event) => getIndexedEventThreadKey(event))).size,

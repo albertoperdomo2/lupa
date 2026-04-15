@@ -1,5 +1,6 @@
 import type { TraceEvent, TraceData, ViewState } from "@/lib/trace-types";
 import type { TraceNormalizationMode } from "@/lib/trace-chat";
+import type { TraceRunSourceSummary } from "@/lib/trace-run";
 
 const DB_NAME = "lupa-traces";
 const DB_VERSION = 1;
@@ -23,6 +24,7 @@ export interface PersistedTracePanePayload {
   traceData: TraceData;
   traceLoadedAt: string | null;
   filename?: string;
+  sources?: TraceRunSourceSummary[];
 }
 
 export interface PersistedTracePaneUiState {
@@ -138,6 +140,7 @@ export async function loadPersistedTraceSession(): Promise<RestoredTraceSession 
           traceData: payload.traceData,
           traceLoadedAt: payload.traceLoadedAt,
           filename: payload.filename,
+          sources: payload.sources,
         },
         state,
       };

@@ -73,7 +73,7 @@ export function CompareControls({
               value="single"
               className="h-8 rounded-sm px-4 text-xs font-semibold text-[#565656] data-[state=active]:border-[#1f1f1f] data-[state=active]:bg-[#1f1f1f] data-[state=active]:text-white data-[state=active]:shadow-sm"
             >
-              Single Trace
+              Single Run
             </TabsTrigger>
             <TabsTrigger
               value="deep"
@@ -108,7 +108,7 @@ export function CompareControls({
                 className="h-8 rounded-sm border-[#ccc] bg-white text-xs text-[#333] hover:bg-[#f4f4f4]"
               >
                 <Upload className="h-3.5 w-3.5" />
-                Load Trace
+                Load Run
               </Button>
               {singleFilename && (
                 <span className="max-w-[320px] truncate text-xs text-[#666]" title={singleFilename}>
@@ -125,7 +125,7 @@ export function CompareControls({
                 className="h-8 rounded-sm border-[#ccc] bg-white text-xs text-[#333] hover:bg-[#f4f4f4]"
               >
                 <Upload className="h-3.5 w-3.5" />
-                Load Baseline
+                Load Baseline Run
               </Button>
               <Button
                 variant="outline"
@@ -134,7 +134,7 @@ export function CompareControls({
                 className="h-8 rounded-sm border-[#ccc] bg-white text-xs text-[#333] hover:bg-[#f4f4f4]"
               >
                 <Upload className="h-3.5 w-3.5" />
-                Load Candidate
+                Load Candidate Run
               </Button>
               <Button
                 variant="outline"
@@ -168,13 +168,13 @@ export function CompareControls({
               <FilenameChip label="Baseline" value={baselineFilename} />
               <FilenameChip label="Candidate" value={candidateFilename} />
               <div className="text-[11px] text-[#666]">
-                Assuming same model, hardware, and workload family. Deep Mode compares raw runtime structure and timing deltas.
+                Assuming same model, hardware, and workload family. Deep Mode compares baseline and candidate runs, and each run can contain multiple trace files.
               </div>
             </>
           )}
           {hasSavedTraces && (
             <div className="text-[11px] text-[#666]">
-              Loaded traces persist on this device and are restored after reload until you clear them.
+              Loaded runs persist on this device and are restored after reload until you clear them.
             </div>
           )}
         </div>

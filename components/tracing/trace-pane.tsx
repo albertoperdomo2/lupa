@@ -55,7 +55,7 @@ export function TracePane({
   if (!traceData) {
     return (
       <div className="flex h-full items-center justify-center bg-white text-xs text-[#666]">
-        Load {label.toLowerCase()} trace.
+        Load {label.toLowerCase()} run.
       </div>
     );
   }

@@ -842,17 +842,30 @@ function buildSerializationAnomalies(spanEventsByThread: Map<string, IndexedTrac
     const materiallyActive = heavyThreads.filter((thread) => thread.coverage >= threshold);
     if (materiallyActive.length < 2) continue;
 
-    const unionCoverage = sumIntervals(
-      mergeIntervals(materiallyActive.flatMap((thread) => thread.intervals))
-    );
+    const allIntervals: Interval[] = [];
+    const eventIds: string[] = [];
+    let startTime = Number.POSITIVE_INFINITY;
+    let endTime = Number.NEGATIVE_INFINITY;
+
+    for (const thread of materiallyActive) {
+      for (const interval of thread.intervals) {
+        allIntervals.push(interval);
+        startTime = Math.min(startTime, interval.start);
+        endTime = Math.max(endTime, interval.end);
+      }
+
+      for (const eventId of thread.eventIds) {
+        if (eventIds.length >= 10) break;
+        eventIds.push(eventId);
+      }
+    }
+
+    const unionCoverage = sumIntervals(mergeIntervals(allIntervals));
     if (unionCoverage <= 0) continue;
 
     const sumCoverage = materiallyActive.reduce((sum, thread) => sum + thread.coverage, 0);
     const concurrencyRatio = sumCoverage / unionCoverage;
     if (concurrencyRatio > 1.1) continue;
-
-    const startTime = Math.min(...materiallyActive.flatMap((thread) => thread.intervals.map((interval) => interval.start)));
-    const endTime = Math.max(...materiallyActive.flatMap((thread) => thread.intervals.map((interval) => interval.end)));
     const fingerprint = `serialization:${processEntry.processName}`;
 
     anomalies.push({
@@ -870,7 +883,7 @@ function buildSerializationAnomalies(spanEventsByThread: Map<string, IndexedTrac
       duration: Math.max(endTime - startTime, 0),
       processName: processEntry.processName,
       sampleEventId: materiallyActive[0]?.eventIds[0] ?? null,
-      eventIds: uniqueStrings(materiallyActive.flatMap((thread) => thread.eventIds)).slice(0, 10),
+      eventIds: uniqueStrings(eventIds).slice(0, 10),
       relatedCounters: [],
       stats: {
         materialThreadCount: materiallyActive.length,
