@@ -1,5 +1,5 @@
 import { JSONParser } from "@streamparser/json";
-import type { TraceData, TraceEvent } from "@/lib/trace-types";
+import type { TraceData, TraceEvent, TraceDeviceProperties, TraceDistributedInfo } from "@/lib/trace-types";
 
 type JsonKey = string | number | undefined;
 
@@ -31,6 +31,13 @@ self.onmessage = async (event: MessageEvent<TraceParseRequest>) => {
 
   const events: TraceEvent[] = [];
   let metadata: TraceData["metadata"] | undefined;
+  let deviceProperties: TraceDeviceProperties[] | undefined;
+  let distributedInfo: TraceDistributedInfo | undefined;
+  let traceName: string | undefined;
+  let traceId: string | undefined;
+  let schemaVersion: number | undefined;
+  let withStack: boolean | undefined;
+  let recordShapes: boolean | undefined;
   let bytesRead = 0;
   let lastProgressTime = 0;
   let isBareArray: boolean | null = null;
@@ -51,7 +58,19 @@ self.onmessage = async (event: MessageEvent<TraceParseRequest>) => {
   }
 
   function createParser(bareArray: boolean): JSONParser {
-    const paths = bareArray ? ["$.*"] : ["$.traceEvents.*", "$.metadata"];
+    const paths = bareArray
+      ? ["$.*"]
+      : [
+          "$.traceEvents.*",
+          "$.metadata",
+          "$.deviceProperties",
+          "$.distributedInfo",
+          "$.traceName",
+          "$.trace_id",
+          "$.schemaVersion",
+          "$.with_stack",
+          "$.record_shapes",
+        ];
 
     const p = new JSONParser({ paths, keepStack: false });
 
@@ -75,8 +94,17 @@ self.onmessage = async (event: MessageEvent<TraceParseRequest>) => {
         events.push(value as TraceEvent);
         return;
       }
-      if (stack.length === 1 && key === "metadata") {
-        metadata = value as TraceData["metadata"];
+      if (stack.length === 1) {
+        switch (key) {
+          case "metadata": metadata = value as TraceData["metadata"]; break;
+          case "deviceProperties": deviceProperties = value as TraceDeviceProperties[]; break;
+          case "distributedInfo": distributedInfo = value as TraceDistributedInfo; break;
+          case "traceName": traceName = value as string; break;
+          case "trace_id": traceId = value as string; break;
+          case "schemaVersion": schemaVersion = value as number; break;
+          case "with_stack": withStack = value === 1 || value === true; break;
+          case "record_shapes": recordShapes = value === 1 || value === true; break;
+        }
       }
     };
 
@@ -131,10 +159,19 @@ self.onmessage = async (event: MessageEvent<TraceParseRequest>) => {
     return;
   }
 
-  const traceData: TraceData =
-    isBareArray
-      ? { traceEvents: events }
-      : { traceEvents: events, metadata };
+  const traceData: TraceData = isBareArray
+    ? { traceEvents: events }
+    : {
+        traceEvents: events,
+        metadata,
+        deviceProperties,
+        distributedInfo,
+        traceName,
+        traceId,
+        schemaVersion,
+        withStack,
+        recordShapes,
+      };
 
   self.postMessage({
     kind: "result",

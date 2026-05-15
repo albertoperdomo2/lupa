@@ -17,6 +17,29 @@ export interface TraceEvent {
   };
 }
 
+export interface TraceDeviceProperties {
+  name?: string;
+  totalGlobalMem?: number;
+  computeMajor?: number;
+  computeMinor?: number;
+  numSms?: number;
+  maxThreadsPerBlock?: number;
+}
+
+export interface TraceDistributedInfo {
+  backend?: string;
+  rank?: number;
+  world_size?: number;
+  pg_count?: number;
+  pg_config?: Array<{
+    pg_name?: string;
+    pg_desc?: string;
+    backend_config?: string;
+    pg_size?: number;
+    ranks?: number[];
+  }>;
+}
+
 export interface TraceData {
   traceEvents: TraceEvent[];
   metadata?: {
@@ -30,6 +53,13 @@ export interface TraceData {
     "physical-memory"?: number;
     "trace-capture-datetime"?: string;
   };
+  deviceProperties?: TraceDeviceProperties[];
+  distributedInfo?: TraceDistributedInfo;
+  traceName?: string;
+  traceId?: string;
+  schemaVersion?: number;
+  withStack?: boolean;
+  recordShapes?: boolean;
 }
 
 export interface ProcessThread {
@@ -137,6 +167,18 @@ export function formatTimeShort(microseconds: number): string {
   } else {
     return `${(microseconds / 1000000).toFixed(2)} s`;
   }
+}
+
+export function calculateTickInterval(visibleDuration: number): number {
+  const targetTicks = 10;
+  const rawInterval = visibleDuration / targetTicks;
+  const magnitude = Math.pow(10, Math.floor(Math.log10(rawInterval)));
+  const normalized = rawInterval / magnitude;
+
+  if (normalized < 1.5) return magnitude;
+  if (normalized < 3) return 2 * magnitude;
+  if (normalized < 7) return 5 * magnitude;
+  return 10 * magnitude;
 }
 
 export function getTraceEventKind(event: Pick<TraceEvent, "ph" | "dur" | "__lupa">): TraceEventKind {

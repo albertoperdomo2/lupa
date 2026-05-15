@@ -75,12 +75,7 @@ export function DetailsPanel({
           {/* Arguments */}
           {event.args && Object.keys(event.args).length > 0 && (
             <div className="mt-3 pt-3 border-t border-[#ddd]">
-              <div className="text-xs font-medium text-[#666] mb-2">Arguments</div>
-              <div className="bg-[#f8f8f8] rounded p-2 font-mono text-xs text-[#333] overflow-x-auto border border-[#e0e0e0]">
-                <pre className="whitespace-pre-wrap break-all">
-                  {JSON.stringify(event.args, null, 2)}
-                </pre>
-              </div>
+              <StructuredArgs args={event.args} />
             </div>
           )}
         </div>
@@ -112,4 +107,112 @@ function getPhaseDescription(phase: string): string {
     f: "Async End",
   };
   return phases[phase] || phase;
+}
+
+function formatDims(dims: unknown): string {
+  if (!Array.isArray(dims)) return String(dims);
+  return dims.map((d) => (Array.isArray(d) ? `[${d.join(", ")}]` : String(d))).join(", ");
+}
+
+function truncatePath(path: string, maxLen = 60): string {
+  if (path.length <= maxLen) return path;
+  return "..." + path.slice(-(maxLen - 3));
+}
+
+const STRUCTURED_KEYS = new Set([
+  "Input Dims", "Input type", "Input Strides",
+  "kernel_file", "kernel_backend", "kernel_hash", "num_warps", "num_stages", "stream",
+  "Collective name", "Process Group Name", "Process Group Ranks", "Group size",
+  "In msg nelems", "Out msg nelems",
+  "External id",
+]);
+
+function StructuredArgs({ args }: { args: Record<string, unknown> }) {
+  const hasTensor = "Input Dims" in args || "Input type" in args;
+  const hasKernel = "kernel_file" in args || "kernel_backend" in args;
+  const hasCollective = "Collective name" in args || "Process Group Name" in args;
+  const externalId = args["External id"];
+
+  const remainingArgs: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (!STRUCTURED_KEYS.has(k)) remainingArgs[k] = v;
+  }
+  const hasRemaining = Object.keys(remainingArgs).length > 0;
+
+  return (
+    <>
+      {externalId != null && (
+        <div className="mb-2">
+          <ArgRow label="External ID" value={String(externalId)} />
+        </div>
+      )}
+
+      {hasTensor && (
+        <div className="mb-2">
+          <div className="text-xs font-medium text-[#666] mb-1">Tensor Info</div>
+          <div className="bg-[#f0f5ff] rounded p-1.5 text-xs font-mono text-[#333] border border-[#d0ddf0]">
+            {"Input type" in args && <ArgRow label="Type" value={formatDims(args["Input type"])} />}
+            {"Input Dims" in args && <ArgRow label="Dims" value={formatDims(args["Input Dims"])} />}
+            {"Input Strides" in args && <ArgRow label="Strides" value={formatDims(args["Input Strides"])} />}
+          </div>
+        </div>
+      )}
+
+      {hasKernel && (
+        <div className="mb-2">
+          <div className="text-xs font-medium text-[#666] mb-1">Kernel Info</div>
+          <div className="bg-[#f5f0ff] rounded p-1.5 text-xs font-mono text-[#333] border border-[#ddd0f0]">
+            {"kernel_backend" in args && <ArgRow label="Backend" value={String(args["kernel_backend"])} />}
+            {"num_warps" in args && <ArgRow label="Warps" value={String(args["num_warps"])} />}
+            {"num_stages" in args && <ArgRow label="Stages" value={String(args["num_stages"])} />}
+            {"stream" in args && <ArgRow label="Stream" value={String(args["stream"])} />}
+            {"kernel_file" in args && <ArgRow label="File" value={truncatePath(String(args["kernel_file"]))} />}
+          </div>
+        </div>
+      )}
+
+      {hasCollective && (
+        <div className="mb-2">
+          <div className="text-xs font-medium text-[#666] mb-1">Collective Info</div>
+          <div className="bg-[#f0fff5] rounded p-1.5 text-xs font-mono text-[#333] border border-[#d0f0dd]">
+            {"Collective name" in args && <ArgRow label="Op" value={String(args["Collective name"])} />}
+            {"Process Group Name" in args && <ArgRow label="Group" value={String(args["Process Group Name"])} />}
+            {"Group size" in args && <ArgRow label="Size" value={String(args["Group size"])} />}
+            {"In msg nelems" in args && <ArgRow label="In elems" value={String(args["In msg nelems"])} />}
+            {"Out msg nelems" in args && <ArgRow label="Out elems" value={String(args["Out msg nelems"])} />}
+          </div>
+        </div>
+      )}
+
+      {hasRemaining && (
+        <details className="mt-1">
+          <summary className="text-xs font-medium text-[#666] cursor-pointer select-none">
+            Raw Arguments
+          </summary>
+          <div className="mt-1 bg-[#f8f8f8] rounded p-2 font-mono text-xs text-[#333] overflow-x-auto border border-[#e0e0e0]">
+            <pre className="whitespace-pre-wrap break-all">
+              {JSON.stringify(remainingArgs, null, 2)}
+            </pre>
+          </div>
+        </details>
+      )}
+
+      {!hasRemaining && !hasTensor && !hasKernel && !hasCollective && externalId == null && (
+        <div className="bg-[#f8f8f8] rounded p-2 font-mono text-xs text-[#333] overflow-x-auto border border-[#e0e0e0]">
+          <pre className="whitespace-pre-wrap break-all">
+            {JSON.stringify(args, null, 2)}
+          </pre>
+        </div>
+      )}
+    </>
+  );
+}
+
+function ArgRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline gap-1.5 leading-[18px]">
+      <span className="text-[#888] shrink-0">{label}:</span>
+      <span className="text-[#333] break-all">{value}</span>
+    </div>
+  );
 }
