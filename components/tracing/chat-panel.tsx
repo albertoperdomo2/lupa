@@ -7,8 +7,10 @@ import remarkGfm from "remark-gfm";
 import {
   Bot,
   Camera,
+  ChevronLeft,
   ChevronRight,
   CornerDownLeft,
+  FileText,
   Paperclip,
   Sparkles,
   Trash2,
@@ -27,6 +29,7 @@ export interface ChatPanelMessage {
   role: "user" | "assistant" | "tool";
   content: string;
   attachments?: TraceChatAttachment[];
+  toolName?: string;
 }
 
 interface ChatPanelProps {
@@ -46,7 +49,12 @@ interface ChatPanelProps {
   onRemoveAttachment: (attachmentId: string) => void;
   onSendMessage: (message: string) => Promise<void>;
   onStartAreaCapture: () => void;
+  onAttachTextFile: (file: File) => void;
   onClearHistory: () => void;
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
+  includeContext: boolean;
+  onIncludeContextChange: (value: boolean) => void;
 }
 
 export function ChatPanel({
@@ -66,10 +74,16 @@ export function ChatPanel({
   onRemoveAttachment,
   onSendMessage,
   onStartAreaCapture,
+  onAttachTextFile,
   onClearHistory,
+  collapsed,
+  onToggleCollapse,
+  includeContext,
+  onIncludeContextChange,
 }: ChatPanelProps) {
   const [draft, setDraft] = useState("");
   const endRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({
@@ -79,7 +93,7 @@ export function ChatPanel({
 
   const helperText = useMemo(() => {
     if (!enabled) {
-      return "Set OPENAI_API_KEY in .env to enable trace chat.";
+      return "Set GEMINI_API_KEY or OPENAI_API_KEY in .env to enable trace chat.";
     }
 
     if (!hasTrace) {
@@ -112,17 +126,57 @@ export function ChatPanel({
     await onSendMessage(message);
   }
 
+  if (collapsed) {
+    return (
+      <div className="flex h-full items-center justify-center bg-[#f0f0f0] border-l border-[#ccc]">
+        <button
+          type="button"
+          onClick={onToggleCollapse}
+          className="flex flex-col items-center gap-1.5 py-3 px-1 hover:bg-[#e4e4e4] rounded-sm transition-colors cursor-pointer"
+          title="Expand Trace Agent"
+        >
+          <ChevronLeft className="h-3 w-3 text-[#888]" />
+          <Sparkles className="h-3.5 w-3.5 text-[#333]" />
+          <span className="text-[11px] font-semibold text-[#333] [writing-mode:vertical-lr]">
+            Agent
+          </span>
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full min-w-0 min-h-0 flex-col overflow-hidden bg-[#fafafa]">
       <div className="flex items-center justify-between px-3 py-2 border-b border-[#ccc] bg-[#f0f0f0]">
         <div className="flex items-center gap-2 min-w-0">
-          <div className="w-6 h-6 rounded-sm bg-white border border-[#d9d9d9] flex items-center justify-center">
-            <Sparkles className="h-3.5 w-3.5 text-[#333]" />
-          </div>
-          <div className="min-w-0">
-            <div className="text-xs font-semibold text-[#333]">Trace Agent</div>
-            <div className="text-[11px] text-[#666] truncate">{helperText}</div>
-          </div>
+          {onToggleCollapse ? (
+            <button
+              type="button"
+              onClick={onToggleCollapse}
+              className="flex items-center gap-2 min-w-0 hover:opacity-80 transition-opacity cursor-pointer"
+            >
+              <div className="w-6 h-6 rounded-sm bg-white border border-[#d9d9d9] flex items-center justify-center shrink-0">
+                <Sparkles className="h-3.5 w-3.5 text-[#333]" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-1">
+                  <ChevronRight className="h-3 w-3 text-[#888]" />
+                  <span className="text-xs font-semibold text-[#333]">Trace Agent</span>
+                </div>
+                <div className="text-[11px] text-[#666] truncate">{helperText}</div>
+              </div>
+            </button>
+          ) : (
+            <div className="flex items-center gap-2 min-w-0">
+              <div className="w-6 h-6 rounded-sm bg-white border border-[#d9d9d9] flex items-center justify-center">
+                <Sparkles className="h-3.5 w-3.5 text-[#333]" />
+              </div>
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-[#333]">Trace Agent</div>
+                <div className="text-[11px] text-[#666] truncate">{helperText}</div>
+              </div>
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <Button
@@ -204,7 +258,7 @@ export function ChatPanel({
           placeholder={
             enabled
               ? "Ask why a span is hot, compare traces, or attach an area of the flame graph…"
-              : "Trace chat is disabled until OPENAI_API_KEY is configured."
+              : "Trace chat is disabled — set GEMINI_API_KEY or OPENAI_API_KEY."
           }
           disabled={!enabled || isBusy}
           className="min-h-[96px] resize-none rounded-sm border-[#ccc] bg-white text-sm text-[#333] placeholder:text-[#888] focus-visible:ring-[#b9d4ff]"
@@ -224,10 +278,39 @@ export function ChatPanel({
             >
               <Camera className="h-3.5 w-3.5" />
             </Button>
-            <div className="text-[11px] text-[#666] flex items-center gap-1.5">
-              <CornerDownLeft className="h-3 w-3" />
-              <span>`Enter` sends. `Shift+Enter` adds a line.</span>
-            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".txt,.md,.csv,.log,.json,.yaml,.yml"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) onAttachTextFile(file);
+                e.target.value = "";
+              }}
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              disabled={!enabled || isBusy}
+              onClick={() => fileInputRef.current?.click()}
+              aria-label="Attach a text file"
+              title="Attach a text file"
+              className="h-7 w-7 rounded-sm text-[#666] hover:bg-[#ebebeb] hover:text-[#333]"
+            >
+              <FileText className="h-3.5 w-3.5" />
+            </Button>
+            <label className="flex items-center gap-1.5 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={includeContext}
+                onChange={(e) => onIncludeContextChange(e.target.checked)}
+                disabled={!enabled || isBusy}
+                className="h-3 w-3 accent-[#4285f4] cursor-pointer"
+              />
+              <span className="text-[11px] text-[#666]">Include trace context</span>
+            </label>
           </div>
 
           <Button
@@ -313,7 +396,7 @@ function EmptyPrompt({
           "Tell me how to inspect a slow section once I load a run.",
           "After I load a new run, compare it with the previous one.",
         ]
-    : ["Add OPENAI_API_KEY to .env and restart the app."];
+    : ["Add GEMINI_API_KEY or OPENAI_API_KEY to .env and restart."];
 
   return (
       <div className="rounded-sm border border-dashed border-[#d1d1d1] bg-white px-3 py-4">
@@ -391,25 +474,49 @@ function MessageBubble({ message }: { message: ChatPanelMessage }) {
   );
 }
 
+function formatToolName(name: string): string {
+  return name.replace(/_/g, " ");
+}
+
 function ToolMessageGroup({ messages }: { messages: ChatPanelMessage[] }) {
+  const toolNames = messages
+    .map((m) => m.toolName)
+    .filter((n): n is string => !!n);
+  const uniqueTools = [...new Set(toolNames)];
+
   return (
-    <details className="rounded-sm border border-[#dddddd] bg-[#f7f7f7]">
+    <details open className="rounded-sm border border-[#dddddd] bg-[#f7f7f7]">
       <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2 text-xs text-[#555] [&::-webkit-details-marker]:hidden">
         <div className="flex items-center gap-2">
           <ChevronRight className="h-3.5 w-3.5 transition-transform duration-150 details-open:rotate-90" />
-          <span className="font-medium text-[#444]">Trace Agent steps</span>
-          <span className="text-[#777]">{messages.length}</span>
+          <span className="font-medium text-[#444]">
+            {messages.length === 1 ? "1 tool call" : `${messages.length} tool calls`}
+          </span>
         </div>
-        <span className="text-[11px] text-[#777]">Expand to inspect tool activity</span>
+        <div className="flex items-center gap-1 flex-wrap justify-end">
+          {uniqueTools.map((name) => (
+            <span
+              key={name}
+              className="inline-block rounded-sm bg-[#eaeaea] px-1.5 py-0.5 text-[10px] font-mono text-[#555]"
+            >
+              {formatToolName(name)}
+            </span>
+          ))}
+        </div>
       </summary>
       <div className="border-t border-[#e3e3e3] px-3 py-2">
-        <div className="space-y-2">
+        <div className="space-y-1.5">
           {messages.map((message) => (
             <div
               key={message.id}
-              className="rounded-sm border border-[#e0e0e0] bg-white px-3 py-2 text-xs leading-5 text-[#666]"
+              className="flex items-start gap-2 rounded-sm border border-[#e0e0e0] bg-white px-2.5 py-1.5 text-xs leading-5"
             >
-              {message.content}
+              {message.toolName && (
+                <span className="shrink-0 mt-0.5 rounded-sm bg-[#e8e8e8] px-1.5 py-0.5 text-[10px] font-mono text-[#555]">
+                  {formatToolName(message.toolName)}
+                </span>
+              )}
+              <span className="text-[#666]">{message.content}</span>
             </div>
           ))}
         </div>
@@ -681,6 +788,23 @@ function AttachmentPreview({
               compact ? "max-h-24" : "max-h-40"
             )}
           />
+        </div>
+      </div>
+    );
+  }
+
+  if (attachment.kind === "text") {
+    const sizeKb = Math.round(attachment.content.length / 1024);
+    return (
+      <div className="min-w-0 space-y-1">
+        <div className="flex items-center gap-1.5 text-[11px] font-medium">
+          <FileText className={cn("h-3.5 w-3.5", inverted ? "text-white" : "text-[#666]")} />
+          <span className={cn("truncate", inverted ? "text-white" : "text-[#444]")}>
+            {attachment.filename}
+          </span>
+          <span className={cn("text-[10px]", inverted ? "text-white/60" : "text-[#999]")}>
+            {sizeKb} KB
+          </span>
         </div>
       </div>
     );

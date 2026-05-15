@@ -465,9 +465,17 @@ export interface TraceChatSelectionAttachment extends TraceChatAttachmentBase {
   rawEvent: TraceEvent;
 }
 
+export interface TraceChatTextAttachment extends TraceChatAttachmentBase {
+  kind: "text";
+  source: "file_upload";
+  content: string;
+  filename: string;
+}
+
 export type TraceChatAttachment =
   | TraceChatImageAttachment
-  | TraceChatSelectionAttachment;
+  | TraceChatSelectionAttachment
+  | TraceChatTextAttachment;
 
 export interface TraceChatToolResult {
   callId: string;
@@ -484,6 +492,7 @@ export interface TraceChatRequest {
   previousResponseId?: string | null;
   userMessage?: string | null;
   toolOutputs?: TraceChatToolResult[];
+  previousToolCalls?: TraceChatToolCall[];
   context: TraceChatContext;
   contextMode?: "full" | "delta";
   screenshotDataUrl?: string | null;
@@ -513,6 +522,10 @@ export type TraceChatStreamEvent =
   | {
       type: "assistant_done";
       response: TraceChatResponse;
+    }
+  | {
+      type: "warning";
+      message: string;
     }
   | {
       type: "error";
