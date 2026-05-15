@@ -1,6 +1,5 @@
 "use client";
 import type { Process, TraceData, TraceEvent, ViewState } from "@/lib/trace-types";
-import { normalizeTraceEvents } from "@/lib/trace-analysis";
 import { DetailsPanel } from "@/components/tracing/details-panel";
 import { Minimap } from "@/components/tracing/minimap";
 import { SideToolbar } from "@/components/tracing/side-toolbar";
@@ -48,9 +47,14 @@ export function TracePane({
   onAttachSelection,
   evidenceHighlight,
 }: TracePaneProps) {
-  const normalizedEventCount = traceData
-    ? normalizeTraceEvents(traceData).filter((event) => event.__lupa?.kind !== "marker").length
-    : 0;
+  let normalizedEventCount = 0;
+  for (const process of processes.values()) {
+    for (const thread of process.threads.values()) {
+      for (const event of thread.events) {
+        if (event.__lupa?.kind !== "marker") normalizedEventCount++;
+      }
+    }
+  }
 
   if (!traceData) {
     return (
