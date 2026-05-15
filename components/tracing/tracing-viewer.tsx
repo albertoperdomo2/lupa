@@ -18,6 +18,7 @@ import type {
   TraceChatResponse,
   TraceChatSelectionAttachment,
   TraceChatStreamEvent,
+  TraceChatTextAttachment,
   TraceChatToolCall,
   TraceChatToolResult,
   TraceCompareMetadata,
@@ -64,6 +65,7 @@ import {
 import { buildGitHubRepoMentionToken } from "@/lib/github-repo";
 import { parseTraceFile } from "@/lib/trace-file-reader";
 import { formatTimeShort } from "@/lib/trace-types";
+import type { ImperativePanelHandle } from "react-resizable-panels";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { ChatPanel } from "./chat-panel";
 import type { ChatPanelMessage } from "./chat-panel";
@@ -356,10 +358,8 @@ function normalizeCaptureRect(
 }
 
 function cloneAttachment(attachment: TraceChatAttachment): TraceChatAttachment {
-  if (attachment.kind === "image") {
-    return {
-      ...attachment,
-    };
+  if (attachment.kind === "image" || attachment.kind === "text") {
+    return { ...attachment };
   }
 
   return {
@@ -575,6 +575,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
   const [candidateEvidenceHighlight, setCandidateEvidenceHighlight] =
     useState<TimelineEvidenceHighlight | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<TraceChatAttachment[]>([]);
+  const [includeTraceContext, setIncludeTraceContext] = useState(true);
   const [isCaptureMode, setIsCaptureMode] = useState(false);
   const [captureOrigin, setCaptureOrigin] = useState<CapturePoint | null>(null);
   const [captureCurrent, setCaptureCurrent] = useState<CapturePoint | null>(null);
@@ -583,6 +584,43 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
   const loadTargetRef = useRef<LoadTarget>("single");
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const hasRestoredPersistentChatRef = useRef(false);
+
+  const baselinePanelRef = useRef<ImperativePanelHandle>(null);
+  const candidatePanelRef = useRef<ImperativePanelHandle>(null);
+  const findingsPanelRef = useRef<ImperativePanelHandle>(null);
+  const chatPanelRef = useRef<ImperativePanelHandle>(null);
+  const [baselineCollapsed, setBaselineCollapsed] = useState(false);
+  const [candidateCollapsed, setCandidateCollapsed] = useState(false);
+  const [findingsCollapsed, setFindingsCollapsed] = useState(false);
+  const [chatCollapsed, setChatCollapsed] = useState(false);
+
+  const toggleBaselineCollapse = useCallback(() => {
+    const panel = baselinePanelRef.current;
+    if (!panel) return;
+    if (baselineCollapsed) panel.expand();
+    else panel.collapse();
+  }, [baselineCollapsed]);
+
+  const toggleCandidateCollapse = useCallback(() => {
+    const panel = candidatePanelRef.current;
+    if (!panel) return;
+    if (candidateCollapsed) panel.expand();
+    else panel.collapse();
+  }, [candidateCollapsed]);
+
+  const toggleFindingsCollapse = useCallback(() => {
+    const panel = findingsPanelRef.current;
+    if (!panel) return;
+    if (findingsCollapsed) panel.expand();
+    else panel.collapse();
+  }, [findingsCollapsed]);
+
+  const toggleChatCollapse = useCallback(() => {
+    const panel = chatPanelRef.current;
+    if (!panel) return;
+    if (chatCollapsed) panel.expand();
+    else panel.collapse();
+  }, [chatCollapsed]);
 
   const singleNormalized = useMemo(
     () => normalizeTraceEvents(singleTrace.traceData),
@@ -1426,6 +1464,30 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
     );
   }, []);
 
+  const handleAttachTextFile = useCallback((file: File) => {
+    const maxSize = 100 * 1024;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let content = reader.result as string;
+      if (content.length > maxSize) {
+        content = content.slice(0, maxSize) + "\n\n[... truncated at 100 KB ...]";
+      }
+      const attachment: TraceChatTextAttachment = {
+        id: createLocalId("text"),
+        kind: "text",
+        source: "file_upload",
+        label: file.name,
+        createdAt: new Date().toISOString(),
+        traceId: null,
+        traceLabel: null,
+        content,
+        filename: file.name,
+      };
+      setPendingAttachments((prev) => [...prev, attachment]);
+    };
+    reader.readAsText(file);
+  }, []);
+
   const attachSelectionFromTarget = useCallback(
     (target: RuntimeTargetKey) => {
       const traceIndex =
@@ -1979,6 +2041,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         previousResponseId: string | null;
         userMessage?: string | null;
         toolOutputs?: TraceChatToolResult[];
+        previousToolCalls?: TraceChatToolCall[];
         context: TraceChatContext;
         contextMode?: "full" | "delta";
         screenshotDataUrl?: string | null;
@@ -2038,6 +2101,11 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
 
         if (parsedEvent.type === "assistant_done") {
           finalResponse = parsedEvent.response;
+          return;
+        }
+
+        if (parsedEvent.type === "warning") {
+          onAssistantDelta(`> ⚠️ ${parsedEvent.message}\n\n`);
           return;
         }
 
@@ -3246,6 +3314,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
       let latestResponseId = chatResponseId;
       let pendingUserMessage: string | null = trimmed || null;
       let pendingToolOutputs: TraceChatToolResult[] | undefined;
+      let pendingPreviousToolCalls: TraceChatToolCall[] | undefined;
       let pendingRequestAttachments =
         outgoingAttachments.length > 0 ? outgoingAttachments : undefined;
       let pendingRepoMentions = nextAttachedRepos.length > 0 ? nextAttachedRepos : undefined;
@@ -3275,14 +3344,25 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
             ? await captureCurrentScreenshot()
             : null;
 
+          const emptyContext: TraceChatContext = {
+            currentTrace: null,
+            previousTrace: null,
+            currentView: null,
+            comparisonToPrevious: null,
+            deepCompare: null,
+          };
+
           const response = await requestTraceChat(
             {
               previousResponseId: latestResponseId,
               userMessage: pendingUserMessage,
               toolOutputs: pendingToolOutputs,
-              context: buildRuntimeChatContext(runtime),
-              contextMode: pendingContextMode,
-              screenshotDataUrl,
+              previousToolCalls: pendingPreviousToolCalls,
+              context: includeTraceContext
+                ? buildRuntimeChatContext(runtime)
+                : emptyContext,
+              contextMode: includeTraceContext ? pendingContextMode : "full",
+              screenshotDataUrl: includeTraceContext ? screenshotDataUrl : null,
               attachments: pendingRequestAttachments,
               repoMentions: pendingRepoMentions,
             },
@@ -3383,12 +3463,14 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
                 id: createLocalId("tool"),
                 role: "tool",
                 content: execution.logMessage,
+                toolName: toolCall.name,
               },
             ]);
           }
 
           pendingUserMessage = null;
           pendingToolOutputs = nextToolOutputs;
+          pendingPreviousToolCalls = response.toolCalls;
           pendingRequestAttachments = undefined;
           pendingRepoMentions = nextAttachedRepos.length > 0 ? nextAttachedRepos : undefined;
           pendingContextMode = "delta";
@@ -3437,6 +3519,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
       chatBusy,
       chatResponseId,
       executeToolCall,
+      includeTraceContext,
       mode,
       pendingAttachments,
       requestTraceChat,
@@ -3617,9 +3700,14 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
       <div ref={workspaceRef} className="relative flex-1 overflow-hidden">
         <ResizablePanelGroup direction="horizontal" className="h-full min-w-0 min-h-0 overflow-hidden">
           <ResizablePanel
+            ref={baselinePanelRef}
             className="min-w-0 min-h-0 overflow-hidden"
             defaultSize={35}
             minSize={16}
+            collapsible
+            collapsedSize={2}
+            onCollapse={() => setBaselineCollapsed(true)}
+            onExpand={() => setBaselineCollapsed(false)}
           >
             <TracePane
               label="Baseline"
@@ -3675,15 +3763,22 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               }
               onAttachSelection={() => attachSelectionFromTarget("baseline")}
               evidenceHighlight={baselineEvidenceHighlight}
+              collapsed={baselineCollapsed}
+              onToggleCollapse={toggleBaselineCollapse}
             />
           </ResizablePanel>
 
           <ResizableHandle withHandle className="bg-[#d3d3d3]" />
 
           <ResizablePanel
+            ref={candidatePanelRef}
             className="min-w-0 min-h-0 overflow-hidden"
             defaultSize={35}
             minSize={16}
+            collapsible
+            collapsedSize={2}
+            onCollapse={() => setCandidateCollapsed(true)}
+            onExpand={() => setCandidateCollapsed(false)}
           >
             <TracePane
               label="Candidate"
@@ -3739,19 +3834,28 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               }
               onAttachSelection={() => attachSelectionFromTarget("candidate")}
               evidenceHighlight={candidateEvidenceHighlight}
+              collapsed={candidateCollapsed}
+              onToggleCollapse={toggleCandidateCollapse}
             />
           </ResizablePanel>
 
           <ResizableHandle withHandle className="bg-[#d3d3d3]" />
 
           <ResizablePanel
+            ref={findingsPanelRef}
             className="min-w-0 min-h-0 overflow-hidden"
             defaultSize={30}
             minSize={14}
+            collapsible
+            collapsedSize={2}
+            onCollapse={() => setFindingsCollapsed(true)}
+            onExpand={() => setFindingsCollapsed(false)}
           >
             <CompareFindingsPanel
               report={deepCompareReport}
               onFocusFinding={handleFocusCompareFinding}
+              collapsed={findingsCollapsed}
+              onToggleCollapse={toggleFindingsCollapse}
             />
           </ResizablePanel>
         </ResizablePanelGroup>
@@ -3795,7 +3899,16 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
 
         <ResizableHandle withHandle className="bg-[#ccc]" />
 
-        <ResizablePanel className="min-w-0 min-h-0 overflow-hidden" defaultSize={26} minSize={18}>
+        <ResizablePanel
+          ref={chatPanelRef}
+          className="min-w-0 min-h-0 overflow-hidden"
+          defaultSize={26}
+          minSize={18}
+          collapsible
+          collapsedSize={2}
+          onCollapse={() => setChatCollapsed(true)}
+          onExpand={() => setChatCollapsed(false)}
+        >
           <ChatPanel
             enabled={chatEnabled}
             model={chatModel}
@@ -3817,7 +3930,12 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
             onRemoveAttachment={handleRemoveAttachment}
             onSendMessage={handleSendMessage}
             onStartAreaCapture={handleStartAreaCapture}
+            onAttachTextFile={handleAttachTextFile}
             onClearHistory={handleClearHistory}
+            collapsed={chatCollapsed}
+            onToggleCollapse={toggleChatCollapse}
+            includeContext={includeTraceContext}
+            onIncludeContextChange={setIncludeTraceContext}
           />
         </ResizablePanel>
       </ResizablePanelGroup>
