@@ -18,9 +18,16 @@ chmod +x "$LUPA_INSTALL_PATH"
 
 if [[ ! -f "$LUPA_HOME/.env" ]]; then
   cat >"$LUPA_HOME/.env" <<'EOF'
-# Optional. Without this, Trace Agent stays disabled.
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-5.4
+# LLM provider: "gemini" or "openai" (auto-detected from API key if omitted)
+# LLM_PROVIDER=gemini
+
+# Google Gemini (recommended — generous free tier)
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-2.5-flash
+
+# OpenAI (alternative)
+# OPENAI_API_KEY=
+# OPENAI_MODEL=gpt-5.4
 EOF
   chmod 600 "$LUPA_HOME/.env"
 fi

@@ -7,8 +7,24 @@ import type {
   TraceChatToolCall,
 } from "@/lib/trace-chat";
 import { buildGitHubRepoSnapshot } from "@/lib/github-repo";
+import {
+  buildGeminiAttachmentParts,
+  buildGeminiContents,
+  convertToolsForGemini,
+  createGeminiStream,
+  getGeminiModel,
+} from "@/lib/llm-gemini";
 
 export const runtime = "nodejs";
+
+type LlmProvider = "openai" | "gemini";
+
+function getProvider(): LlmProvider {
+  const explicit = process.env.LLM_PROVIDER;
+  if (explicit === "openai" || explicit === "gemini") return explicit;
+  if (process.env.GEMINI_API_KEY) return "gemini";
+  return "openai";
+}
 
 const OPENAI_API_URL = "https://api.openai.com/v1/responses";
 const DEFAULT_OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.4";
@@ -671,10 +687,105 @@ function buildDeltaContextText(body: TraceChatRequest): string {
   ].join("\n\n");
 }
 
+function buildMinimalContextText(body: TraceChatRequest): string {
+  const context = body.context;
+  const currentTrace = context.currentTrace;
+  return [
+    "APP_CONTEXT_UPDATE",
+    "Minimal context due to token budget constraints. Ask the user to zoom into a specific region for richer context.",
+    JSON.stringify(
+      {
+        currentTrace: currentTrace
+          ? {
+              id: currentTrace.id,
+              label: currentTrace.label,
+              eventCount: currentTrace.eventCount,
+              bounds: currentTrace.bounds,
+              countsByKind: currentTrace.countsByKind,
+              topHotspots: currentTrace.topHotspots.slice(0, 3),
+              topAnomalies: currentTrace.topAnomalies.slice(0, 2),
+            }
+          : null,
+        currentView: context.currentView
+          ? {
+              startTime: context.currentView.startTime,
+              endTime: context.currentView.endTime,
+              visibleSpanCount: context.currentView.visibleSpanCount,
+              selectedEvent: context.currentView.selectedEvent,
+              topVisibleHotspots: context.currentView.topVisibleHotspots.slice(0, 3),
+            }
+          : null,
+      },
+      null,
+      2
+    ),
+  ].join("\n\n");
+}
+
+function isTPMLimitError(message: string): boolean {
+  return (
+    /tokens per min/i.test(message) ||
+    /request too large/i.test(message) ||
+    /token.*limit/i.test(message)
+  );
+}
+
+async function buildMinimalInput(body: TraceChatRequest) {
+  const input: Array<Record<string, unknown>> = [];
+
+  for (const toolOutput of body.toolOutputs ?? []) {
+    const raw = JSON.stringify(toolOutput.output);
+    input.push({
+      type: "function_call_output",
+      call_id: toolOutput.callId,
+      output: raw.length > 2000 ? raw.slice(0, 2000) + "..." : raw,
+    });
+  }
+
+  input.push({
+    role: "user",
+    content: [
+      {
+        type: "input_text",
+        text: buildMinimalContextText(body),
+      },
+      ...buildAttachmentInputs(
+        body.attachments?.filter((a) => a.kind !== "image")
+      ),
+    ],
+  });
+
+  if (body.userMessage?.trim()) {
+    input.push({
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: body.userMessage.trim(),
+        },
+      ],
+    });
+  }
+
+  return input;
+}
+
 function buildAttachmentInputs(attachments: TraceChatAttachment[] | undefined) {
   const content: Array<Record<string, unknown>> = [];
 
   for (const attachment of attachments ?? []) {
+    if (attachment.kind === "text") {
+      content.push({
+        type: "input_text",
+        text: [
+          "APP_ATTACHMENT",
+          `Text file "${attachment.filename}" uploaded by the user.`,
+          attachment.content,
+        ].join("\n\n"),
+      });
+      continue;
+    }
+
     if (attachment.kind === "image") {
       content.push({
         type: "input_text",
@@ -945,11 +1056,59 @@ function createTraceChatPayload(
   };
 }
 
+const NDJSON_HEADERS = {
+  "Content-Type": "application/x-ndjson; charset=utf-8",
+  "Cache-Control": "no-cache, no-transform",
+  Connection: "keep-alive",
+} as const;
+
+async function createGeminiStreamedResponse(
+  body: TraceChatRequest
+): Promise<Response> {
+  const contextText =
+    body.contextMode === "delta"
+      ? buildDeltaContextText(body)
+      : buildFullContextText(body);
+
+  const attachmentParts = buildGeminiAttachmentParts(
+    body.attachments as Array<{ kind: string; [key: string]: unknown }> | undefined
+  );
+
+  const toolOutputs = (body.toolOutputs ?? []).map((t) => ({
+    callId: t.callId,
+    name: t.name,
+    output: t.output,
+  }));
+
+  const contents = buildGeminiContents(
+    contextText,
+    body.screenshotDataUrl ?? null,
+    attachmentParts,
+    body.userMessage?.trim() || null,
+    toolOutputs,
+    body.previousToolCalls,
+  );
+
+  const tools = convertToolsForGemini(TOOL_DEFINITIONS);
+
+  const stream = await createGeminiStream(
+    TRACE_CHAT_INSTRUCTIONS,
+    contents,
+    tools,
+  );
+
+  return new Response(stream, { headers: NDJSON_HEADERS });
+}
+
 async function createStreamedResponse(
   body: TraceChatRequest
 ): Promise<Response | NextResponse<{ error: string }>> {
+  if (getProvider() === "gemini") {
+    return createGeminiStreamedResponse(body);
+  }
+
   const openAiRequestBody = await buildOpenAiRequestBody({ ...body, stream: true });
-  const upstreamResponse = await fetch(OPENAI_API_URL, {
+  let upstreamResponse = await fetch(OPENAI_API_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -958,9 +1117,48 @@ async function createStreamedResponse(
     body: JSON.stringify(openAiRequestBody),
   });
 
+  let retried = false;
+
   if (!upstreamResponse.ok) {
     const errorMessage = await parseUpstreamErrorMessage(upstreamResponse);
-    return NextResponse.json({ error: errorMessage }, { status: upstreamResponse.status });
+
+    if (
+      (upstreamResponse.status === 429 || upstreamResponse.status === 400) &&
+      isTPMLimitError(errorMessage)
+    ) {
+      const minimalBody = {
+        model: DEFAULT_OPENAI_MODEL,
+        instructions: TRACE_CHAT_INSTRUCTIONS,
+        input: await buildMinimalInput(body),
+        tools: TOOL_DEFINITIONS,
+        parallel_tool_calls: false,
+        store: true,
+        stream: true,
+      };
+
+      upstreamResponse = await fetch(OPENAI_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify(minimalBody),
+      });
+      retried = true;
+
+      if (!upstreamResponse.ok) {
+        const retryError = await parseUpstreamErrorMessage(upstreamResponse);
+        return NextResponse.json(
+          { error: retryError },
+          { status: upstreamResponse.status }
+        );
+      }
+    } else {
+      return NextResponse.json(
+        { error: errorMessage },
+        { status: upstreamResponse.status }
+      );
+    }
   }
 
   if (!upstreamResponse.body) {
@@ -987,6 +1185,13 @@ async function createStreamedResponse(
       const emit = (event: TraceChatStreamEvent) => {
         controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
       };
+
+      if (retried) {
+        emit({
+          type: "warning",
+          message: "Context was too large — retrying with reduced context. Some details may be unavailable.",
+        });
+      }
 
       const recordToolCall = (
         name: unknown,
@@ -1164,19 +1369,24 @@ async function createStreamedResponse(
     },
   });
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "application/x-ndjson; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-    },
-  });
+  return new Response(stream, { headers: NDJSON_HEADERS });
 }
 
 export async function POST(request: NextRequest) {
-  if (!process.env.OPENAI_API_KEY) {
+  const provider = getProvider();
+  const hasKey =
+    provider === "gemini"
+      ? Boolean(process.env.GEMINI_API_KEY)
+      : Boolean(process.env.OPENAI_API_KEY);
+
+  if (!hasKey) {
     return NextResponse.json(
-      { error: "OPENAI_API_KEY is not configured." },
+      {
+        error:
+          provider === "gemini"
+            ? "GEMINI_API_KEY is not configured."
+            : "OPENAI_API_KEY is not configured.",
+      },
       { status: 500 }
     );
   }
