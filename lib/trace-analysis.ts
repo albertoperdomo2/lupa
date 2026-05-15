@@ -8,7 +8,6 @@ import {
   type ViewState,
 } from "@/lib/trace-types";
 import {
-  buildTraceAnomalies,
   getVisibleTraceAnomalies,
   summarizeAnomalyKinds,
 } from "@/lib/trace-anomalies";
@@ -256,7 +255,10 @@ export function normalizeTraceEvents(traceData: TraceData | null): TraceEvent[] 
   return normalized;
 }
 
-export function buildProcessMap(traceData: TraceData | null): Map<number, Process> {
+export function buildProcessMap(
+  traceData: TraceData | null,
+  preNormalizedEvents?: TraceEvent[]
+): Map<number, Process> {
   if (!traceData) return new Map<number, Process>();
 
   const processMap = new Map<number, Process>();
@@ -302,7 +304,7 @@ export function buildProcessMap(traceData: TraceData | null): Map<number, Proces
     }
   }
 
-  for (const event of normalizeTraceEvents(traceData)) {
+  for (const event of (preNormalizedEvents ?? normalizeTraceEvents(traceData))) {
     if (!processMap.has(event.pid)) {
       processMap.set(event.pid, {
         pid: event.pid,
@@ -561,7 +563,7 @@ export function buildTraceIndex(
     });
   }
 
-  const baseIndex: TraceIndex = {
+  return {
     events,
     eventById,
     idByEvent,
@@ -569,14 +571,6 @@ export function buildTraceIndex(
     spanNodeById: buildSpanNodeIndex(eventsByThread),
     anomalies: [],
     anomalyById: new Map(),
-  };
-  const anomalies = buildTraceAnomalies(baseIndex);
-  const anomalyById = new Map(anomalies.map((anomaly) => [anomaly.id, anomaly]));
-
-  return {
-    ...baseIndex,
-    anomalies,
-    anomalyById,
   };
 }
 

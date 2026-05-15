@@ -36,7 +36,8 @@ import {
   normalizeTraceEvents,
   searchTraceEvents,
 } from "@/lib/trace-analysis";
-import { compareTraceAnomalies } from "@/lib/trace-anomalies";
+import { buildTraceAnomalies, compareTraceAnomalies } from "@/lib/trace-anomalies";
+import type { TraceAnomaly } from "@/lib/trace-chat";
 import {
   clearPersistedTraceSession,
   loadPersistedTraceSession,
@@ -583,17 +584,30 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const hasRestoredPersistentChatRef = useRef(false);
 
-  const singleProcesses = useMemo(
-    () => buildProcessMap(singleTrace.traceData),
+  const singleNormalized = useMemo(
+    () => normalizeTraceEvents(singleTrace.traceData),
     [singleTrace.traceData]
   );
-  const baselineProcesses = useMemo(
-    () => buildProcessMap(baselineTrace.traceData),
+  const baselineNormalized = useMemo(
+    () => normalizeTraceEvents(baselineTrace.traceData),
     [baselineTrace.traceData]
   );
-  const candidateProcesses = useMemo(
-    () => buildProcessMap(candidateTrace.traceData),
+  const candidateNormalized = useMemo(
+    () => normalizeTraceEvents(candidateTrace.traceData),
     [candidateTrace.traceData]
+  );
+
+  const singleProcesses = useMemo(
+    () => buildProcessMap(singleTrace.traceData, singleNormalized),
+    [singleTrace.traceData, singleNormalized]
+  );
+  const baselineProcesses = useMemo(
+    () => buildProcessMap(baselineTrace.traceData, baselineNormalized),
+    [baselineTrace.traceData, baselineNormalized]
+  );
+  const candidateProcesses = useMemo(
+    () => buildProcessMap(candidateTrace.traceData, candidateNormalized),
+    [candidateTrace.traceData, candidateNormalized]
   );
 
   useEffect(() => {
@@ -655,18 +669,58 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
     };
   }, []);
 
-  const singleTraceIndex = useMemo(
+  const singleBaseIndex = useMemo(
     () => buildTraceIndex(singleTrace.traceData, singleProcesses),
     [singleProcesses, singleTrace.traceData]
   );
-  const baselineTraceIndex = useMemo(
+  const baselineBaseIndex = useMemo(
     () => buildTraceIndex(baselineTrace.traceData, baselineProcesses),
     [baselineProcesses, baselineTrace.traceData]
   );
-  const candidateTraceIndex = useMemo(
+  const candidateBaseIndex = useMemo(
     () => buildTraceIndex(candidateTrace.traceData, candidateProcesses),
     [candidateProcesses, candidateTrace.traceData]
   );
+
+  const [singleAnomalies, setSingleAnomalies] = useState<TraceAnomaly[]>([]);
+  const [baselineAnomalies, setBaselineAnomalies] = useState<TraceAnomaly[]>([]);
+  const [candidateAnomalies, setCandidateAnomalies] = useState<TraceAnomaly[]>([]);
+
+  useEffect(() => {
+    if (!singleBaseIndex) { setSingleAnomalies([]); return; }
+    const handle = requestIdleCallback(() => setSingleAnomalies(buildTraceAnomalies(singleBaseIndex)));
+    return () => cancelIdleCallback(handle);
+  }, [singleBaseIndex]);
+
+  useEffect(() => {
+    if (!baselineBaseIndex) { setBaselineAnomalies([]); return; }
+    const handle = requestIdleCallback(() => setBaselineAnomalies(buildTraceAnomalies(baselineBaseIndex)));
+    return () => cancelIdleCallback(handle);
+  }, [baselineBaseIndex]);
+
+  useEffect(() => {
+    if (!candidateBaseIndex) { setCandidateAnomalies([]); return; }
+    const handle = requestIdleCallback(() => setCandidateAnomalies(buildTraceAnomalies(candidateBaseIndex)));
+    return () => cancelIdleCallback(handle);
+  }, [candidateBaseIndex]);
+
+  const singleTraceIndex = useMemo(() => {
+    if (!singleBaseIndex) return null;
+    if (singleAnomalies.length === 0) return singleBaseIndex;
+    return { ...singleBaseIndex, anomalies: singleAnomalies, anomalyById: new Map(singleAnomalies.map((a) => [a.id, a])) };
+  }, [singleBaseIndex, singleAnomalies]);
+
+  const baselineTraceIndex = useMemo(() => {
+    if (!baselineBaseIndex) return null;
+    if (baselineAnomalies.length === 0) return baselineBaseIndex;
+    return { ...baselineBaseIndex, anomalies: baselineAnomalies, anomalyById: new Map(baselineAnomalies.map((a) => [a.id, a])) };
+  }, [baselineBaseIndex, baselineAnomalies]);
+
+  const candidateTraceIndex = useMemo(() => {
+    if (!candidateBaseIndex) return null;
+    if (candidateAnomalies.length === 0) return candidateBaseIndex;
+    return { ...candidateBaseIndex, anomalies: candidateAnomalies, anomalyById: new Map(candidateAnomalies.map((a) => [a.id, a])) };
+  }, [candidateBaseIndex, candidateAnomalies]);
 
   const singleTraceSnapshot = useMemo(() => {
     if (!singleTrace.traceData || !singleTraceIndex) return null;

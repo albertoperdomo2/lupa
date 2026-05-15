@@ -6,15 +6,21 @@ import {
   buildViewportSummary,
   inspectTraceAnomaly,
 } from "@/lib/trace-analysis";
-import { compareTraceAnomalies } from "@/lib/trace-anomalies";
+import { buildTraceAnomalies, compareTraceAnomalies } from "@/lib/trace-anomalies";
 import type { TraceData, TraceEvent } from "@/lib/trace-types";
 
 function buildIndexedTrace(traceData: TraceData) {
   const processMap = buildProcessMap(traceData);
-  const index = buildTraceIndex(traceData, processMap);
+  const baseIndex = buildTraceIndex(traceData, processMap);
 
-  expect(index).not.toBeNull();
-  return index!;
+  expect(baseIndex).not.toBeNull();
+
+  const anomalies = buildTraceAnomalies(baseIndex!);
+  return {
+    ...baseIndex!,
+    anomalies,
+    anomalyById: new Map(anomalies.map((a) => [a.id, a])),
+  };
 }
 
 function withMetadata(
