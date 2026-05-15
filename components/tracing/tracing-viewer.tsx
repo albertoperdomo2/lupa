@@ -61,6 +61,7 @@ import {
   findCompareRegion,
 } from "@/lib/trace-compare";
 import { buildGitHubRepoMentionToken } from "@/lib/github-repo";
+import { parseTraceFile } from "@/lib/trace-file-reader";
 import { formatTimeShort } from "@/lib/trace-types";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { ChatPanel } from "./chat-panel";
@@ -319,47 +320,6 @@ function getRunLoadProgressMessage(progress: RunLoadProgress): string {
   }
 
   return `Reading file ${fileNumber}/${progress.fileCount}: ${filename}`;
-}
-
-function parseTraceFileContent(content: string, filename: string): TraceRunInput {
-  const data = JSON.parse(content) as TraceData | TraceData["traceEvents"];
-
-  if (Array.isArray(data)) {
-    return {
-      traceData: { traceEvents: data },
-      filename,
-    };
-  }
-
-  if (data && typeof data === "object" && Array.isArray(data.traceEvents)) {
-    return {
-      traceData: data,
-      filename,
-    };
-  }
-
-  throw new Error("Invalid trace format. Expected Chrome trace JSON format.");
-}
-
-function readTraceFileText(
-  file: File,
-  onProgress?: (loadedBytes: number) => void
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-
-    reader.onprogress = (event) => {
-      if (!event.lengthComputable) return;
-      onProgress?.(event.loaded);
-    };
-
-    reader.onload = (loadEvent) => {
-      resolve((loadEvent.target?.result as string) ?? "");
-    };
-
-    reader.onerror = () => reject(new Error(`Failed to read ${file.name}.`));
-    reader.readAsText(file);
-  });
 }
 
 function buildAttachedTraceSummary(trace: TraceSnapshot): AttachedTraceSummary {
@@ -1190,37 +1150,27 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
           });
           await waitForFrames(1);
 
-          const content = await readTraceFileText(file, (loadedBytes) => {
-            setRunLoadProgress((previousState) =>
-              previousState
-                ? {
-                    ...previousState,
-                    stage: "reading",
-                    currentFileIndex: index,
-                    currentFileName: file.name,
-                    loadedBytes: completedBytes + loadedBytes,
-                  }
-                : previousState
-            );
-          });
-
-          setRunLoadProgress({
-            target,
-            stage: "parsing",
-            fileCount: files.length,
-            completedFiles: index,
-            currentFileIndex: index,
-            currentFileName: file.name,
-            totalBytes,
-            loadedBytes: completedBytes + file.size,
-          });
-          await waitForFrames(1);
-
           let input: TraceRunInput;
           try {
-            input = parseTraceFileContent(content, file.name);
-          } catch {
-            throw new Error(`Failed to parse ${file.name}. Make sure it is valid JSON.`);
+            input = await parseTraceFile(file, (bytesRead) => {
+              setRunLoadProgress((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      stage: "reading",
+                      currentFileIndex: index,
+                      currentFileName: file.name,
+                      loadedBytes: completedBytes + bytesRead,
+                    }
+                  : prev
+              );
+            });
+          } catch (error) {
+            throw new Error(
+              error instanceof Error
+                ? error.message
+                : `Failed to parse ${file.name}. Make sure it is valid JSON.`
+            );
           }
 
           appendTraceRunSource(builder, input, index);
