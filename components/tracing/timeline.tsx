@@ -7,6 +7,7 @@ import {
   getTraceEventKind,
   getEventColor,
   isSpikeEvent,
+  calculateTickInterval,
   SPIKE_EVENT_DURATION_THRESHOLD_US,
 } from "@/lib/trace-types";
 
@@ -27,11 +28,21 @@ const PROCESS_HEADER_HEIGHT = 22;
 const THREAD_HEADER_WIDTH = 180;
 const TIME_RULER_HEIGHT = 22;
 const SPIKE_AREA_HEIGHT = 60;
+const COUNTER_TRACK_HEIGHT = 32;
+const COUNTER_TRACK_GAP = 2;
 const THREAD_SECTION_GAP = 6;
 const MIN_EVENT_WIDTH = 1;
 
 interface NestedEvent extends TraceEvent {
   depth: number;
+}
+
+interface CounterTrackData {
+  key: string;
+  name: string;
+  events: Array<{ ts: number; value: number }>;
+  minValue: number;
+  maxValue: number;
 }
 
 interface ProcessThreadData {
@@ -40,6 +51,7 @@ interface ProcessThreadData {
   maxDepth: number;
   events: NestedEvent[];
   instantEvents: TraceEvent[];
+  counterTracks: CounterTrackData[];
 }
 
 interface ThreadLayoutEntry {
@@ -48,9 +60,12 @@ interface ThreadLayoutEntry {
   flameTop: number;
   flameHeight: number;
   spikeTop: number;
+  counterTop: number;
+  counterHeight: number;
   contentHeight: number;
   eventCount: number;
   spikeCount: number;
+  counterTrackCount: number;
 }
 
 export interface TimelineEvidenceHighlight {
@@ -88,6 +103,16 @@ interface HighlightOverlayGeometry {
   markerTop: number;
 }
 
+function numericCounterValue(event: TraceEvent): number | null {
+  if (!event.args) return null;
+  for (const value of Object.values(event.args)) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return null;
+}
+
 function areSameTraceEvent(a: TraceEvent, b: TraceEvent): boolean {
   return (
     a.name === b.name &&
@@ -109,22 +134,6 @@ function getSpikeHeight(event: TraceEvent): number {
   }
 
   return 14;
-}
-
-// Calculate tick interval based on visible duration
-function calculateTickInterval(visibleDuration: number): number {
-  const targetTicks = 10;
-  const rawInterval = visibleDuration / targetTicks;
-  const magnitude = Math.pow(10, Math.floor(Math.log10(rawInterval)));
-  const normalized = rawInterval / magnitude;
-  
-  let interval: number;
-  if (normalized < 1.5) interval = magnitude;
-  else if (normalized < 3) interval = 2 * magnitude;
-  else if (normalized < 7) interval = 5 * magnitude;
-  else interval = 10 * magnitude;
-  
-  return interval;
 }
 
 // Darken a color
@@ -299,15 +308,41 @@ export function Timeline({
           const instantEvents = thread.events.filter((event) => isSpikeEvent(event));
           const nested = buildNestedEvents(spanEvents);
 
+          const counterGroupMap = new Map<string, {
+            name: string;
+            events: Array<{ ts: number; value: number }>;
+          }>();
+          for (const event of thread.events) {
+            if (getTraceEventKind(event) !== "counter") continue;
+            const value = numericCounterValue(event);
+            if (value === null) continue;
+            const key = `${event.name}::${event.cat}`;
+            const group = counterGroupMap.get(key) ?? { name: event.name, events: [] };
+            group.events.push({ ts: event.ts, value });
+            counterGroupMap.set(key, group);
+          }
+          const counterTracks: CounterTrackData[] = [];
+          for (const [key, group] of counterGroupMap) {
+            group.events.sort((a, b) => a.ts - b.ts);
+            let min = Infinity;
+            let max = -Infinity;
+            for (const e of group.events) {
+              if (e.value < min) min = e.value;
+              if (e.value > max) max = e.value;
+            }
+            counterTracks.push({ key, name: group.name, events: group.events, minValue: min, maxValue: max });
+          }
+
           return {
             tid: thread.tid,
             threadName: thread.name,
             maxDepth: nested.maxDepth,
             events: nested.events,
             instantEvents,
+            counterTracks,
           };
         })
-        .filter((thread) => thread.events.length > 0 || thread.instantEvents.length > 0);
+        .filter((thread) => thread.events.length > 0 || thread.instantEvents.length > 0 || thread.counterTracks.length > 0);
 
       result.set(pid, { threads });
     });
@@ -335,7 +370,12 @@ export function Timeline({
 
           const flameHeight = thread.maxDepth * ROW_HEIGHT;
           const spikeTop = threadCursorY + flameHeight;
-          const contentHeight = flameHeight + SPIKE_AREA_HEIGHT;
+          const counterTop = threadCursorY + flameHeight + SPIKE_AREA_HEIGHT;
+          const counterHeight = thread.counterTracks.length > 0
+            ? thread.counterTracks.length * COUNTER_TRACK_HEIGHT
+              + (thread.counterTracks.length - 1) * COUNTER_TRACK_GAP
+            : 0;
+          const contentHeight = flameHeight + SPIKE_AREA_HEIGHT + counterHeight;
 
           threadLayouts.push({
             tid: thread.tid,
@@ -343,9 +383,12 @@ export function Timeline({
             flameTop: threadCursorY,
             flameHeight,
             spikeTop,
+            counterTop,
+            counterHeight,
             contentHeight,
             eventCount: thread.events.length,
             spikeCount: thread.instantEvents.length,
+            counterTrackCount: thread.counterTracks.length,
           });
 
           threadCursorY += contentHeight;
@@ -822,8 +865,11 @@ export function Timeline({
 
         const flameGraphTop = threadLayout.flameTop - scrollY;
         const spikeAreaTop = threadLayout.spikeTop - scrollY;
+        const counterAreaTop = threadLayout.counterTop - scrollY;
         const blockTop = flameGraphTop;
-        const blockBottom = spikeAreaTop + SPIKE_AREA_HEIGHT;
+        const blockBottom = threadLayout.counterHeight > 0
+          ? counterAreaTop + threadLayout.counterHeight
+          : spikeAreaTop + SPIKE_AREA_HEIGHT;
 
         if (blockBottom < TIME_RULER_HEIGHT || blockTop > canvasSize.height) {
           continue;
@@ -861,11 +907,10 @@ export function Timeline({
         ctx.fillStyle = "#666";
         ctx.font = "10px sans-serif";
         ctx.fillText(`tid ${threadLayout.tid}`, 10, flameGraphTop + 28);
-        ctx.fillText(
-          `${threadLayout.eventCount} spans · ${threadLayout.spikeCount} spikes`,
-          10,
-          flameGraphTop + 41
-        );
+        const statsText = threadLayout.counterTrackCount > 0
+          ? `${threadLayout.eventCount} spans · ${threadLayout.spikeCount} spikes · ${threadLayout.counterTrackCount} counters`
+          : `${threadLayout.eventCount} spans · ${threadLayout.spikeCount} spikes`;
+        ctx.fillText(statsText, 10, flameGraphTop + 41);
 
         ctx.strokeStyle = "#e6e6e6";
         ctx.beginPath();
@@ -969,6 +1014,99 @@ export function Timeline({
         ctx.moveTo(0, spikeAreaTop + SPIKE_AREA_HEIGHT);
         ctx.lineTo(canvasSize.width, spikeAreaTop + SPIKE_AREA_HEIGHT);
         ctx.stroke();
+
+        for (let trackIndex = 0; trackIndex < threadData.counterTracks.length; trackIndex++) {
+          const track = threadData.counterTracks[trackIndex];
+          const trackTop = counterAreaTop + trackIndex * (COUNTER_TRACK_HEIGHT + COUNTER_TRACK_GAP);
+          const trackBottom = trackTop + COUNTER_TRACK_HEIGHT;
+
+          if (trackBottom < TIME_RULER_HEIGHT || trackTop > canvasSize.height) continue;
+
+          ctx.fillStyle = "#fcfcfc";
+          ctx.fillRect(THREAD_HEADER_WIDTH, trackTop, canvasSize.width - THREAD_HEADER_WIDTH, COUNTER_TRACK_HEIGHT);
+
+          ctx.fillStyle = "#888";
+          ctx.font = "9px sans-serif";
+          ctx.textAlign = "left";
+          ctx.fillText(truncateCanvasText(ctx, track.name, THREAD_HEADER_WIDTH - 16), 12, trackTop + COUNTER_TRACK_HEIGHT / 2 + 3);
+
+          let visibleEvents: Array<{ ts: number; value: number }> = [];
+          let foundFirst = false;
+          for (let i = 0; i < track.events.length; i++) {
+            const e = track.events[i];
+            if (e.ts > viewState.endTime) {
+              visibleEvents.push(e);
+              break;
+            }
+            if (e.ts >= viewState.startTime) {
+              if (!foundFirst && i > 0) visibleEvents.push(track.events[i - 1]);
+              foundFirst = true;
+              visibleEvents.push(e);
+            }
+          }
+          if (!foundFirst && track.events.length > 0) {
+            const last = track.events[track.events.length - 1];
+            if (last.ts < viewState.startTime) visibleEvents = [last];
+          }
+          if (visibleEvents.length === 0) continue;
+
+          const maxPoints = 2000;
+          if (visibleEvents.length > maxPoints) {
+            const step = Math.ceil(visibleEvents.length / maxPoints);
+            const downsampled: typeof visibleEvents = [];
+            for (let i = 0; i < visibleEvents.length; i += step) {
+              let best = visibleEvents[i];
+              const end = Math.min(i + step, visibleEvents.length);
+              for (let j = i + 1; j < end; j++) {
+                if (visibleEvents[j].value > best.value) best = visibleEvents[j];
+              }
+              downsampled.push(best);
+            }
+            visibleEvents = downsampled;
+          }
+
+          const valueRange = track.maxValue - track.minValue;
+          const effectiveRange = valueRange > 0 ? valueRange : 1;
+          const pad = 2;
+          const valueToY = (v: number) =>
+            trackBottom - pad - ((v - track.minValue) / effectiveRange) * (COUNTER_TRACK_HEIGHT - pad * 2);
+
+          if (visibleEvents.length >= 2) {
+            const clampX = (ts: number) => Math.min(Math.max(timeToPixel(ts), THREAD_HEADER_WIDTH), canvasSize.width);
+
+            ctx.beginPath();
+            ctx.moveTo(clampX(visibleEvents[0].ts), trackBottom - pad);
+            ctx.lineTo(clampX(visibleEvents[0].ts), valueToY(visibleEvents[0].value));
+            for (let i = 1; i < visibleEvents.length; i++) {
+              ctx.lineTo(clampX(visibleEvents[i].ts), valueToY(visibleEvents[i].value));
+            }
+            ctx.lineTo(clampX(visibleEvents[visibleEvents.length - 1].ts), trackBottom - pad);
+            ctx.closePath();
+            ctx.fillStyle = "rgba(100, 149, 237, 0.12)";
+            ctx.fill();
+
+            ctx.beginPath();
+            ctx.moveTo(clampX(visibleEvents[0].ts), valueToY(visibleEvents[0].value));
+            for (let i = 1; i < visibleEvents.length; i++) {
+              ctx.lineTo(clampX(visibleEvents[i].ts), valueToY(visibleEvents[i].value));
+            }
+            ctx.strokeStyle = "rgba(70, 130, 220, 0.6)";
+            ctx.lineWidth = 1;
+            ctx.stroke();
+          } else if (visibleEvents.length === 1) {
+            ctx.fillStyle = "rgba(70, 130, 220, 0.6)";
+            ctx.beginPath();
+            ctx.arc(timeToPixel(visibleEvents[0].ts), valueToY(visibleEvents[0].value), 2, 0, Math.PI * 2);
+            ctx.fill();
+          }
+
+          ctx.strokeStyle = "#eee";
+          ctx.lineWidth = 0.5;
+          ctx.beginPath();
+          ctx.moveTo(THREAD_HEADER_WIDTH, trackBottom);
+          ctx.lineTo(canvasSize.width, trackBottom);
+          ctx.stroke();
+        }
       }
     }
 

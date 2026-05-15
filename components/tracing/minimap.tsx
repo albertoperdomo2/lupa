@@ -2,7 +2,7 @@
 
 import { useRef, useEffect, useCallback, useMemo, useState } from "react";
 import type { TraceData, ViewState } from "@/lib/trace-types";
-import { getEventColor } from "@/lib/trace-types";
+import { getEventColor, calculateTickInterval } from "@/lib/trace-types";
 import { normalizeTraceEvents } from "@/lib/trace-analysis";
 
 interface MinimapProps {
@@ -12,7 +12,8 @@ interface MinimapProps {
   timeBounds: { min: number; max: number };
 }
 
-const MINIMAP_HEIGHT = 24;
+const MINIMAP_HEIGHT = 36;
+const MINIMAP_TICK_HEIGHT = 12;
 const PADDING = 0;
 
 export function Minimap({
@@ -82,6 +83,8 @@ export function Minimap({
 
     // Draw events as density bars
     const events = normalizedEvents;
+    const barTop = MINIMAP_TICK_HEIGHT + 1;
+    const barHeight = MINIMAP_HEIGHT - MINIMAP_TICK_HEIGHT - 3;
     let eventIndex = 0;
 
     for (const event of events) {
@@ -91,7 +94,7 @@ export function Minimap({
 
       const color = getEventColor(event, eventIndex++);
       ctx.fillStyle = color;
-      ctx.fillRect(x1, 3, width, MINIMAP_HEIGHT - 6);
+      ctx.fillRect(x1, barTop, width, barHeight);
     }
 
     // Draw visible region
@@ -101,13 +104,40 @@ export function Minimap({
 
     // Darken non-visible regions
     ctx.fillStyle = "rgba(255, 255, 255, 0.7)";
-    ctx.fillRect(0, 0, viewStart, MINIMAP_HEIGHT);
-    ctx.fillRect(viewEnd, 0, canvasWidth - viewEnd, MINIMAP_HEIGHT);
+    ctx.fillRect(0, MINIMAP_TICK_HEIGHT, viewStart, MINIMAP_HEIGHT - MINIMAP_TICK_HEIGHT);
+    ctx.fillRect(viewEnd, MINIMAP_TICK_HEIGHT, canvasWidth - viewEnd, MINIMAP_HEIGHT - MINIMAP_TICK_HEIGHT);
 
     // Draw visible region border
     ctx.strokeStyle = "#333";
     ctx.lineWidth = 1;
-    ctx.strokeRect(viewStart + 0.5, 0.5, viewWidth - 1, MINIMAP_HEIGHT - 1);
+    ctx.strokeRect(viewStart + 0.5, MINIMAP_TICK_HEIGHT + 0.5, viewWidth - 1, MINIMAP_HEIGHT - MINIMAP_TICK_HEIGHT - 1);
+
+    // Draw time axis
+    const totalDuration = timeBounds.max - timeBounds.min;
+    if (totalDuration > 0) {
+      const tickInterval = calculateTickInterval(totalDuration);
+      const startTick = Math.ceil(timeBounds.min / tickInterval) * tickInterval;
+
+      ctx.strokeStyle = "#bbb";
+      ctx.fillStyle = "#777";
+      ctx.font = "9px sans-serif";
+      ctx.textAlign = "center";
+      ctx.lineWidth = 0.5;
+
+      for (let time = startTick; time <= timeBounds.max; time += tickInterval) {
+        const x = timeToPixel(time);
+        if (x < 0 || x > canvasWidth) continue;
+
+        ctx.beginPath();
+        ctx.moveTo(x, MINIMAP_TICK_HEIGHT - 3);
+        ctx.lineTo(x, MINIMAP_TICK_HEIGHT);
+        ctx.stroke();
+
+        const seconds = time / 1_000_000;
+        const label = seconds >= 1 ? `${seconds.toFixed(0)}s` : `${(seconds * 1000).toFixed(0)}ms`;
+        ctx.fillText(label, x, MINIMAP_TICK_HEIGHT - 4);
+      }
+    }
   }, [normalizedEvents, viewState, timeBounds, canvasWidth, timeToPixel]);
 
   // Handle mouse events
