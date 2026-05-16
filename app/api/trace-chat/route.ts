@@ -1134,6 +1134,7 @@ async function createGeminiStreamedResponse(
     body.userMessage?.trim() || null,
     toolOutputs,
     body.previousToolCalls,
+    body.conversationHistory,
   );
 
   const tools = convertToolsForGemini(TOOL_DEFINITIONS);

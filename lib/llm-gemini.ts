@@ -6,7 +6,7 @@ import type {
   Part,
   Tool,
 } from "@google/genai";
-import type { TraceChatResponse, TraceChatStreamEvent, TraceChatToolCall } from "./trace-chat";
+import type { ConversationHistoryTurn, TraceChatResponse, TraceChatStreamEvent, TraceChatToolCall } from "./trace-chat";
 
 const DEFAULT_GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
@@ -108,46 +108,68 @@ export function buildGeminiContents(
   userMessage: string | null,
   toolOutputs: Array<{ callId: string; name: string; output: unknown }>,
   previousToolCalls?: Array<{ callId: string; name: string; arguments: Record<string, unknown> }>,
+  conversationHistory?: ConversationHistoryTurn[],
 ): Content[] {
   const contents: Content[] = [];
 
-  const extraUserParts: Part[] = [];
+  const buildUserParts = (): Part[] => {
+    const parts: Part[] = [];
+    parts.push({ text: contextText });
+    if (screenshotDataUrl) {
+      const base64 = screenshotDataUrl.replace(/^data:[^;]+;base64,/, "");
+      parts.push({ inlineData: { mimeType: "image/png", data: base64 } });
+    }
+    parts.push(...attachmentParts);
+    if (userMessage) {
+      parts.push({ text: userMessage });
+    }
+    return parts;
+  };
 
-  extraUserParts.push({ text: contextText });
+  if (conversationHistory?.length) {
+    contents.push({ role: "user", parts: buildUserParts() });
 
-  if (screenshotDataUrl) {
-    const base64 = screenshotDataUrl.replace(/^data:[^;]+;base64,/, "");
-    extraUserParts.push({
-      inlineData: { mimeType: "image/png", data: base64 },
-    });
-  }
+    for (const turn of conversationHistory) {
+      const modelParts: Part[] = [];
+      if (turn.assistantText) {
+        modelParts.push({ text: turn.assistantText });
+      }
+      for (const tc of turn.toolCalls) {
+        modelParts.push({ functionCall: { name: tc.name, args: tc.arguments } });
+      }
+      if (modelParts.length > 0) {
+        contents.push({ role: "model", parts: modelParts });
+      }
 
-  extraUserParts.push(...attachmentParts);
+      const responseParts: Part[] = turn.toolOutputs.map((to) =>
+        createPartFromFunctionResponse(to.callId, to.name, { output: to.output }),
+      );
+      if (responseParts.length > 0) {
+        contents.push({ role: "user", parts: responseParts });
+      }
+    }
 
-  if (userMessage) {
-    extraUserParts.push({ text: userMessage });
+    return contents;
   }
 
   if (previousToolCalls?.length && toolOutputs.length > 0) {
-    // Gemini requires: user → model(functionCall) → user(functionResponse)
-    // The initial user turn provides context for the model's decision to call tools.
     contents.push({ role: "user", parts: [{ text: "Continue." }] });
-
     contents.push({
       role: "model",
       parts: previousToolCalls.map((tc) => ({
         functionCall: { name: tc.name, args: tc.arguments },
       })),
     });
-
-    // Function responses + updated context go in the same user turn
     const responseParts: Part[] = toolOutputs.map((to) =>
       createPartFromFunctionResponse(to.callId, to.name, { output: to.output }),
     );
-    responseParts.push(...extraUserParts);
+    responseParts.push(...buildUserParts());
     contents.push({ role: "user", parts: responseParts });
-  } else if (extraUserParts.length > 0) {
-    contents.push({ role: "user", parts: extraUserParts });
+  } else {
+    const userParts = buildUserParts();
+    if (userParts.length > 0) {
+      contents.push({ role: "user", parts: userParts });
+    }
   }
 
   return contents;

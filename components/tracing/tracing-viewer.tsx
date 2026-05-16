@@ -12,6 +12,7 @@ import { toCanvas } from "html-to-image";
 import type { Process, TraceData, TraceEvent, ViewState } from "@/lib/trace-types";
 import type {
   AttachedTraceSummary,
+  ConversationHistoryTurn,
   GitHubRepoMention,
   TraceChatAttachment,
   TraceChatContext,
@@ -83,6 +84,7 @@ import { TracePane, TraceInfoBadge } from "./trace-pane";
 interface LupaAppProps {
   chatEnabled: boolean;
   chatModel: string;
+  chatProvider: "gemini" | "openai";
 }
 
 interface TimelineApi {
@@ -579,7 +581,7 @@ function MiniFlameLoader() {
   );
 }
 
-export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
+export function LupaApp({ chatEnabled, chatModel, chatProvider }: LupaAppProps) {
   const [isHydrated, setIsHydrated] = useState(false);
   const [mode, setMode] = useState<ViewerMode>("single");
   const [singleTrace, setSingleTrace] = useState<TracePaneState>(() => createEmptyTracePaneState());
@@ -2087,6 +2089,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         screenshotDataUrl?: string | null;
         attachments?: TraceChatAttachment[];
         repoMentions?: GitHubRepoMention[];
+        conversationHistory?: ConversationHistoryTurn[];
       },
       onAssistantDelta: (delta: string) => void
     ): Promise<TraceChatResponse> => {
@@ -3396,6 +3399,8 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
       let pendingRepoMentions = nextAttachedRepos.length > 0 ? nextAttachedRepos : undefined;
       let pendingContextMode: "full" | "delta" = "full";
       let shouldAttachScreenshot = true;
+      const isGemini = chatProvider === "gemini";
+      const conversationHistory: ConversationHistoryTurn[] = [];
       const runtime: ToolExecutionRuntime = {
         mode,
         single: {
@@ -3433,7 +3438,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               previousResponseId: latestResponseId,
               userMessage: pendingUserMessage,
               toolOutputs: pendingToolOutputs,
-              previousToolCalls: pendingPreviousToolCalls,
+              previousToolCalls: isGemini ? undefined : pendingPreviousToolCalls,
               context: includeTraceContext
                 ? buildRuntimeChatContext(runtime)
                 : emptyContext,
@@ -3441,6 +3446,9 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
               screenshotDataUrl: includeTraceContext ? screenshotDataUrl : null,
               attachments: pendingRequestAttachments,
               repoMentions: pendingRepoMentions,
+              conversationHistory: isGemini && conversationHistory.length > 0
+                ? conversationHistory
+                : undefined,
             },
             (delta) => {
               streamedAssistantText += delta;
@@ -3544,13 +3552,26 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
             ]);
           }
 
-          pendingUserMessage = null;
+          if (isGemini) {
+            conversationHistory.push({
+              assistantText: response.assistantText,
+              toolCalls: response.toolCalls,
+              toolOutputs: nextToolOutputs,
+            });
+          }
+
           pendingToolOutputs = nextToolOutputs;
           pendingPreviousToolCalls = response.toolCalls;
-          pendingRequestAttachments = undefined;
           pendingRepoMentions = nextAttachedRepos.length > 0 ? nextAttachedRepos : undefined;
-          pendingContextMode = "delta";
           shouldAttachScreenshot = nextStepNeedsScreenshot;
+
+          if (isGemini) {
+            shouldAttachScreenshot = true;
+          } else {
+            pendingUserMessage = null;
+            pendingRequestAttachments = undefined;
+            pendingContextMode = "delta";
+          }
         }
 
         setChatErrorMessage("The assistant hit the current tool-step limit before finishing.");

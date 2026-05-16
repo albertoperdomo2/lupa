@@ -488,6 +488,12 @@ export interface GitHubRepoMention {
   url: string;
 }
 
+export interface ConversationHistoryTurn {
+  assistantText: string;
+  toolCalls: TraceChatToolCall[];
+  toolOutputs: TraceChatToolResult[];
+}
+
 export interface TraceChatRequest {
   previousResponseId?: string | null;
   userMessage?: string | null;
@@ -499,6 +505,7 @@ export interface TraceChatRequest {
   attachments?: TraceChatAttachment[];
   repoMentions?: GitHubRepoMention[];
   stream?: boolean;
+  conversationHistory?: ConversationHistoryTurn[];
 }
 
 export interface TraceChatToolCall {

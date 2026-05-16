@@ -20,5 +20,5 @@ export default function Page() {
       ? process.env.GEMINI_MODEL || "gemini-2.5-flash"
       : process.env.OPENAI_MODEL || "gpt-5.4";
 
-  return <LupaApp chatEnabled={chatEnabled} chatModel={chatModel} />;
+  return <LupaApp chatEnabled={chatEnabled} chatModel={chatModel} chatProvider={provider} />;
 }
