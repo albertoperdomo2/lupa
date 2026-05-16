@@ -29,6 +29,16 @@ export interface TraceRunBuilder {
   combinedEvents: TraceEvent[];
   sources: TraceRunSourceSummary[];
   metadata?: TraceData["metadata"];
+  deviceProperties?: TraceData["deviceProperties"];
+  distributedInfo?: TraceData["distributedInfo"];
+  traceName?: string;
+  traceId?: string;
+  schemaVersion?: number;
+  withStack?: boolean;
+  recordShapes?: boolean;
+  cudaDriverVersion?: number;
+  cudaRuntimeVersion?: number;
+  cuptiVersion?: number;
 }
 
 function createSourceId(index: number, label: string): string {
@@ -189,6 +199,24 @@ export function appendTraceRunSource(
   if (!builder.metadata && input.traceData.metadata) {
     builder.metadata = input.traceData.metadata;
   }
+  if (!builder.deviceProperties && input.traceData.deviceProperties) {
+    builder.deviceProperties = input.traceData.deviceProperties;
+  }
+  if (!builder.distributedInfo && input.traceData.distributedInfo) {
+    builder.distributedInfo = input.traceData.distributedInfo;
+  }
+  if (!builder.traceName && input.traceData.traceName) {
+    builder.traceName = input.traceData.traceName;
+  }
+  if (!builder.traceId && input.traceData.traceId) {
+    builder.traceId = input.traceData.traceId;
+  }
+  builder.schemaVersion ??= input.traceData.schemaVersion;
+  builder.withStack ??= input.traceData.withStack;
+  builder.recordShapes ??= input.traceData.recordShapes;
+  builder.cudaDriverVersion ??= input.traceData.cudaDriverVersion;
+  builder.cudaRuntimeVersion ??= input.traceData.cudaRuntimeVersion;
+  builder.cuptiVersion ??= input.traceData.cuptiVersion;
 }
 
 export function finalizeTraceRunBuilder(
@@ -201,6 +229,16 @@ export function finalizeTraceRunBuilder(
     traceData: {
       traceEvents: builder.combinedEvents,
       metadata: builder.metadata,
+      deviceProperties: builder.deviceProperties,
+      distributedInfo: builder.distributedInfo,
+      traceName: builder.traceName,
+      traceId: builder.traceId,
+      schemaVersion: builder.schemaVersion,
+      withStack: builder.withStack,
+      recordShapes: builder.recordShapes,
+      cudaDriverVersion: builder.cudaDriverVersion,
+      cudaRuntimeVersion: builder.cudaRuntimeVersion,
+      cuptiVersion: builder.cuptiVersion,
     },
     sources: builder.sources,
     displayName: createRunDisplayName(

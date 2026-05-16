@@ -38,6 +38,9 @@ self.onmessage = async (event: MessageEvent<TraceParseRequest>) => {
   let schemaVersion: number | undefined;
   let withStack: boolean | undefined;
   let recordShapes: boolean | undefined;
+  let cudaDriverVersion: number | undefined;
+  let cudaRuntimeVersion: number | undefined;
+  let cuptiVersion: number | undefined;
   let bytesRead = 0;
   let lastProgressTime = 0;
   let isBareArray: boolean | null = null;
@@ -70,6 +73,9 @@ self.onmessage = async (event: MessageEvent<TraceParseRequest>) => {
           "$.schemaVersion",
           "$.with_stack",
           "$.record_shapes",
+          "$.cuda_driver_version",
+          "$.cuda_runtime_version",
+          "$.cupti_version",
         ];
 
     const p = new JSONParser({ paths, keepStack: false });
@@ -104,6 +110,9 @@ self.onmessage = async (event: MessageEvent<TraceParseRequest>) => {
           case "schemaVersion": schemaVersion = value as number; break;
           case "with_stack": withStack = value === 1 || value === true; break;
           case "record_shapes": recordShapes = value === 1 || value === true; break;
+          case "cuda_driver_version": cudaDriverVersion = value as number; break;
+          case "cuda_runtime_version": cudaRuntimeVersion = value as number; break;
+          case "cupti_version": cuptiVersion = value as number; break;
         }
       }
     };
@@ -171,6 +180,9 @@ self.onmessage = async (event: MessageEvent<TraceParseRequest>) => {
         schemaVersion,
         withStack,
         recordShapes,
+        cudaDriverVersion,
+        cudaRuntimeVersion,
+        cuptiVersion,
       };
 
   self.postMessage({

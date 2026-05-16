@@ -18,12 +18,20 @@ export interface TraceEvent {
 }
 
 export interface TraceDeviceProperties {
+  id?: number;
   name?: string;
   totalGlobalMem?: number;
   computeMajor?: number;
   computeMinor?: number;
   numSms?: number;
   maxThreadsPerBlock?: number;
+  maxThreadsPerMultiprocessor?: number;
+  regsPerBlock?: number;
+  regsPerMultiprocessor?: number;
+  warpSize?: number;
+  sharedMemPerBlock?: number;
+  sharedMemPerMultiprocessor?: number;
+  sharedMemPerBlockOptin?: number;
 }
 
 export interface TraceDistributedInfo {
@@ -38,6 +46,7 @@ export interface TraceDistributedInfo {
     pg_size?: number;
     ranks?: number[];
   }>;
+  nccl_version?: string;
 }
 
 export interface TraceData {
@@ -60,6 +69,9 @@ export interface TraceData {
   schemaVersion?: number;
   withStack?: boolean;
   recordShapes?: boolean;
+  cudaDriverVersion?: number;
+  cudaRuntimeVersion?: number;
+  cuptiVersion?: number;
 }
 
 export interface ProcessThread {
