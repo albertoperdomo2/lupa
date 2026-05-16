@@ -7,7 +7,7 @@ LUPA_ENV_FILE="${LUPA_ENV_FILE:-$LUPA_HOME/.env}"
 LUPA_STATE_FILE="${LUPA_STATE_FILE:-$LUPA_HOME/runtime.env}"
 LUPA_CONTAINER_NAME="${LUPA_CONTAINER_NAME:-lupa}"
 LUPA_IMAGE="${LUPA_IMAGE:-ghcr.io/albertoperdomo2/lupa:latest}"
-LUPA_PORT="${LUPA_PORT:-80}"
+LUPA_PORT="${LUPA_PORT:-3874}"
 LUPA_RUNTIME="${LUPA_RUNTIME:-}"
 LUPA_NETWORK="lupa"
 
@@ -62,11 +62,6 @@ EOF
 
 format_url() {
   local port="${1:-$LUPA_PORT}"
-  if [[ "$port" == "80" ]]; then
-    printf 'http://lupa.lvh.me\n'
-    return
-  fi
-
   printf 'http://lupa.lvh.me:%s\n' "$port"
 }
 
