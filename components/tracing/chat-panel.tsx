@@ -1,9 +1,10 @@
 "use client";
 
 import Image from "next/image";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Bot,
   Camera,
@@ -48,6 +49,7 @@ interface ChatPanelProps {
   errorMessage: string | null;
   onRemoveAttachment: (attachmentId: string) => void;
   onSendMessage: (message: string) => Promise<void>;
+  onCancelMessage: () => string | undefined;
   onStartAreaCapture: () => void;
   onAttachTextFile: (file: File) => void;
   onClearHistory: () => void;
@@ -73,6 +75,7 @@ export function ChatPanel({
   errorMessage,
   onRemoveAttachment,
   onSendMessage,
+  onCancelMessage,
   onStartAreaCapture,
   onAttachTextFile,
   onClearHistory,
@@ -83,12 +86,20 @@ export function ChatPanel({
 }: ChatPanelProps) {
   const [draft, setDraft] = useState("");
   const endRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const isNearBottom = useRef(true);
+
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    isNearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+  }, []);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({
-      block: "end",
-    });
+    if (isNearBottom.current) {
+      endRef.current?.scrollIntoView({ block: "end" });
+    }
   }, [messages, isBusy]);
 
   const helperText = useMemo(() => {
@@ -197,7 +208,7 @@ export function ChatPanel({
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-3 py-3">
+      <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-3 py-3">
         <div className="space-y-3">
           {messages.length === 0 ? (
             <EmptyPrompt enabled={enabled} hasTrace={hasTrace} />
@@ -250,6 +261,12 @@ export function ChatPanel({
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
+            if (event.key === "Escape" && isBusy) {
+              event.preventDefault();
+              const restored = onCancelMessage();
+              if (restored !== undefined) setDraft(restored);
+              return;
+            }
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               void handleSubmit();
@@ -301,16 +318,23 @@ export function ChatPanel({
             >
               <FileText className="h-3.5 w-3.5" />
             </Button>
-            <label className="flex items-center gap-1.5 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={includeContext}
-                onChange={(e) => onIncludeContextChange(e.target.checked)}
-                disabled={!enabled || isBusy}
-                className="h-3 w-3 accent-[#4285f4] cursor-pointer"
-              />
-              <span className="text-[11px] text-[#666]">Include trace context</span>
-            </label>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={includeContext}
+                    onChange={(e) => onIncludeContextChange(e.target.checked)}
+                    disabled={!enabled || isBusy}
+                    className="h-3 w-3 accent-[#4285f4] cursor-pointer"
+                  />
+                  <span className="text-[11px] text-[#666]">Include trace context</span>
+                </label>
+              </TooltipTrigger>
+              <TooltipContent side="top" sideOffset={6}>
+                Send the full trace context with each message. Disable if the trace is too large for your model&apos;s context window.
+              </TooltipContent>
+            </Tooltip>
           </div>
 
           <Button
