@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { LupaApp } from "@/components/tracing/tracing-viewer";
 
 function detectProvider(): "gemini" | "openai" {
