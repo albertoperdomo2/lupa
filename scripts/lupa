@@ -7,8 +7,9 @@ LUPA_ENV_FILE="${LUPA_ENV_FILE:-$LUPA_HOME/.env}"
 LUPA_STATE_FILE="${LUPA_STATE_FILE:-$LUPA_HOME/runtime.env}"
 LUPA_CONTAINER_NAME="${LUPA_CONTAINER_NAME:-lupa}"
 LUPA_IMAGE="${LUPA_IMAGE:-ghcr.io/albertoperdomo2/lupa:latest}"
-LUPA_PORT="${LUPA_PORT:-3874}"
+LUPA_PORT="${LUPA_PORT:-80}"
 LUPA_RUNTIME="${LUPA_RUNTIME:-}"
+LUPA_NETWORK="lupa"
 
 die() {
   printf 'lupa: %s\n' "$*" >&2
@@ -45,9 +46,16 @@ ensure_env_file() {
   fi
 
   cat >"$LUPA_ENV_FILE" <<'EOF'
-# Optional. Without this, Trace Agent stays disabled.
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-5.4
+# LLM provider: "gemini" or "openai" (auto-detected from API key if omitted)
+# LLM_PROVIDER=gemini
+
+# Google Gemini (recommended — generous free tier)
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-2.5-flash
+
+# OpenAI (alternative)
+# OPENAI_API_KEY=
+# OPENAI_MODEL=gpt-5.4
 EOF
   chmod 600 "$LUPA_ENV_FILE"
 }
@@ -55,11 +63,11 @@ EOF
 format_url() {
   local port="${1:-$LUPA_PORT}"
   if [[ "$port" == "80" ]]; then
-    printf 'http://lupa.localhost\n'
+    printf 'http://lupa.lvh.me\n'
     return
   fi
 
-  printf 'http://lupa.localhost:%s\n' "$port"
+  printf 'http://lupa.lvh.me:%s\n' "$port"
 }
 
 save_state() {
@@ -137,9 +145,11 @@ cmd_run() {
     "$runtime" rm -f "$LUPA_CONTAINER_NAME" >/dev/null
   fi
 
+  "$runtime" network create "$LUPA_NETWORK" 2>/dev/null || true
   "$runtime" pull "$image" >/dev/null
   "$runtime" run -d \
     --name "$LUPA_CONTAINER_NAME" \
+    --network "$LUPA_NETWORK" \
     --restart unless-stopped \
     --env-file "$LUPA_ENV_FILE" \
     -p "127.0.0.1:${port}:3000" \
@@ -183,6 +193,35 @@ cmd_logs() {
   "$RUNTIME" logs -f "$CONTAINER_NAME"
 }
 
+cmd_update() {
+  load_state
+
+  printf 'pulling %s …\n' "$IMAGE"
+  "$RUNTIME" pull "$IMAGE"
+
+  if container_running "$RUNTIME" "$CONTAINER_NAME"; then
+    printf 'restarting …\n'
+    "$RUNTIME" stop "$CONTAINER_NAME" >/dev/null
+    "$RUNTIME" rm -f "$CONTAINER_NAME" >/dev/null
+
+    "$RUNTIME" network create "$LUPA_NETWORK" 2>/dev/null || true
+    "$RUNTIME" run -d \
+      --name "$CONTAINER_NAME" \
+      --network "$LUPA_NETWORK" \
+      --restart unless-stopped \
+      --env-file "$LUPA_ENV_FILE" \
+      -p "127.0.0.1:${PORT}:3000" \
+      "$IMAGE" >/dev/null
+
+    printf 'lupa updated and running at %s\n' "$URL"
+  else
+    if container_exists "$RUNTIME" "$CONTAINER_NAME"; then
+      "$RUNTIME" rm -f "$CONTAINER_NAME" >/dev/null
+    fi
+    printf 'image updated. run `lupa run` to start.\n'
+  fi
+}
+
 cmd_uninstall() {
   load_state
 
@@ -191,6 +230,7 @@ cmd_uninstall() {
   fi
 
   "$RUNTIME" image rm -f "$IMAGE" >/dev/null 2>&1 || true
+  "$RUNTIME" network rm "$LUPA_NETWORK" >/dev/null 2>&1 || true
   rm -rf "$LUPA_HOME"
 
   local installed_path="${LUPA_BIN_DIR}/lupa"
@@ -205,6 +245,7 @@ usage() {
   cat <<EOF
 Usage:
   lupa run [--port PORT] [--image IMAGE] [--runtime docker|podman]
+  lupa update
   lupa stop
   lupa status
   lupa logs
@@ -226,6 +267,9 @@ main() {
   case "$command" in
     run)
       cmd_run "$@"
+      ;;
+    update)
+      cmd_update
       ;;
     stop)
       cmd_stop
