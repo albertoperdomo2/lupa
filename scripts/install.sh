@@ -4,14 +4,14 @@ set -euo pipefail
 LUPA_HOME="${LUPA_HOME:-$HOME/.lupa}"
 LUPA_BIN_DIR="${LUPA_BIN_DIR:-$HOME/.local/bin}"
 LUPA_INSTALL_PATH="${LUPA_INSTALL_PATH:-$LUPA_BIN_DIR/lupa}"
-LUPA_INSTALL_BASE_URL="${LUPA_INSTALL_BASE_URL:-https://raw.githubusercontent.com/albertoperdomo2/lupa/main}"
+LUPA_INSTALL_BASE_URL="${LUPA_INSTALL_BASE_URL:-https://albertoperdomo.me/lupa}"
 
 mkdir -p "$LUPA_HOME" "$LUPA_BIN_DIR"
 
 if [[ -f "${BASH_SOURCE[0]%/*}/lupa" ]]; then
   cp "${BASH_SOURCE[0]%/*}/lupa" "$LUPA_INSTALL_PATH"
 else
-  curl -fsSL "$LUPA_INSTALL_BASE_URL/scripts/lupa" -o "$LUPA_INSTALL_PATH"
+  curl -fsSL "$LUPA_INSTALL_BASE_URL/cli" -o "$LUPA_INSTALL_PATH"
 fi
 
 chmod +x "$LUPA_INSTALL_PATH"
