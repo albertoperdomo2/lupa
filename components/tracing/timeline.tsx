@@ -235,11 +235,20 @@ export function Timeline({
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
-  const [isPanning, setIsPanning] = useState(false);
-  const [panStart, setPanStart] = useState({ x: 0, y: 0 });
+  const isPanningRef = useRef(false);
+  const panStartRef = useRef({ x: 0, y: 0 });
   const [scrollY, setScrollY] = useState(0);
-  const [hoveredEvent, setHoveredEvent] = useState<TraceEvent | null>(null);
-  const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+  const scrollYRef = useRef(0);
+  const hoveredEventRef = useRef<TraceEvent | null>(null);
+  const [tooltipState, setTooltipState] = useState<{
+    event: TraceEvent;
+    x: number;
+    y: number;
+  } | null>(null);
+  const mousePosRef = useRef({ x: 0, y: 0 });
+  const rafIdRef = useRef(0);
+  const scrollRafIdRef = useRef(0);
+  const pendingScrollDeltaRef = useRef(0);
   const [collapsedProcesses, setCollapsedProcesses] = useState<Set<number>>(new Set());
   const [activeEvidenceHighlight, setActiveEvidenceHighlight] =
     useState<TimelineEvidenceHighlight | null>(null);
@@ -251,6 +260,17 @@ export function Timeline({
     fade: null,
     clear: null,
   });
+
+  useEffect(() => {
+    scrollYRef.current = scrollY;
+  }, [scrollY]);
+
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
+      if (scrollRafIdRef.current) cancelAnimationFrame(scrollRafIdRef.current);
+    };
+  }, []);
 
   const captureImage = useCallback(() => {
     const canvas = canvasRef.current;
@@ -935,7 +955,7 @@ export function Timeline({
 
           const color = getEventColor(event, eventColorIndex++);
           const isSelected = selectedEvent?.name === event.name && selectedEvent?.ts === event.ts;
-          const isHovered = hoveredEvent?.name === event.name && hoveredEvent?.ts === event.ts;
+          const isHovered = hoveredEventRef.current?.name === event.name && hoveredEventRef.current?.ts === event.ts;
           const matchesSearch = searchQuery && event.name.toLowerCase().includes(searchQuery.toLowerCase());
 
           ctx.fillStyle = color;
@@ -1123,61 +1143,9 @@ export function Timeline({
       ctx.stroke();
     }
 
-    // Draw hover tooltip
-    if (hoveredEvent && !isPanning) {
-      const dur = hoveredEvent.dur || 0;
-      const category = hoveredEvent.cat || "N/A";
-      const tooltipLines = [
-        hoveredEvent.name,
-        `Duration: ${formatTimeShort(dur)}`,
-        `Category: ${category}`,
-        `Start: ${(hoveredEvent.ts / 1_000_000).toFixed(6)} s`,
-      ];
-
-      ctx.font = "11px sans-serif";
-      const maxWidth = Math.max(...tooltipLines.map((l) => ctx.measureText(l).width));
-      const padding = 8;
-      const lineHeight = 16;
-      const tooltipWidth = Math.min(maxWidth + padding * 2, 450);
-      const tooltipHeight = tooltipLines.length * lineHeight + padding * 2 - 4;
-
-      const tooltipX = Math.min(mousePos.x + 15, canvasSize.width - tooltipWidth - 10);
-      const tooltipY = Math.max(mousePos.y - tooltipHeight - 10, TIME_RULER_HEIGHT + 5);
-
-      // Shadow
-      ctx.fillStyle = "rgba(0, 0, 0, 0.15)";
-      ctx.fillRect(tooltipX + 3, tooltipY + 3, tooltipWidth, tooltipHeight);
-
-      // Background
-      ctx.fillStyle = "#fff";
-      ctx.fillRect(tooltipX, tooltipY, tooltipWidth, tooltipHeight);
-      ctx.strokeStyle = "#999";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(tooltipX, tooltipY, tooltipWidth, tooltipHeight);
-
-      // Text
-      ctx.fillStyle = "#000";
-      ctx.font = "bold 11px sans-serif";
-      ctx.textAlign = "left";
-
-      let displayName = tooltipLines[0];
-      while (ctx.measureText(displayName).width > tooltipWidth - padding * 2 && displayName.length > 5) {
-        displayName = displayName.slice(0, -5) + "...";
-      }
-      ctx.fillText(displayName, tooltipX + padding, tooltipY + padding + 12);
-
-      ctx.fillStyle = "#333";
-      ctx.font = "11px sans-serif";
-      for (let i = 1; i < tooltipLines.length; i++) {
-        ctx.fillText(tooltipLines[i], tooltipX + padding, tooltipY + padding + 12 + i * lineHeight);
-      }
-    }
   }, [
     canvasSize,
     collapsedProcesses,
-    hoveredEvent,
-    isPanning,
-    mousePos,
     processes,
     processLayouts,
     processedData,
@@ -1223,8 +1191,8 @@ export function Timeline({
       }
 
       if (tool === "pan" || e.button === 1) {
-        setIsPanning(true);
-        setPanStart({ x: e.clientX, y: e.clientY });
+        isPanningRef.current = true;
+        panStartRef.current = { x: e.clientX, y: e.clientY };
         e.preventDefault();
       } else if (tool === "select" && x > THREAD_HEADER_WIDTH) {
         const event = findEventAtPosition(x, y);
@@ -1234,6 +1202,22 @@ export function Timeline({
     [tool, findEventAtPosition, handleProcessHeaderClick, onEventSelect, processLayouts, scrollY]
   );
 
+  const viewStateRef = useRef(viewState);
+  const onViewStateChangeRef = useRef(onViewStateChange);
+  const canvasSizeRef = useRef(canvasSize);
+  const totalHeightRef = useRef(totalHeight);
+  const findEventAtPositionRef = useRef(findEventAtPosition);
+  const pixelToTimeRef = useRef(pixelToTime);
+
+  useEffect(() => {
+    viewStateRef.current = viewState;
+    onViewStateChangeRef.current = onViewStateChange;
+    canvasSizeRef.current = canvasSize;
+    totalHeightRef.current = totalHeight;
+    findEventAtPositionRef.current = findEventAtPosition;
+    pixelToTimeRef.current = pixelToTime;
+  });
+
   const handleMouseMove = useCallback(
     (e: React.MouseEvent) => {
       const rect = canvasRef.current?.getBoundingClientRect();
@@ -1241,53 +1225,58 @@ export function Timeline({
 
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
+      const clientX = e.clientX;
+      const clientY = e.clientY;
 
-      setMousePos({ x, y });
+      mousePosRef.current = { x, y };
 
-      if (isPanning) {
-        const dx = e.clientX - panStart.x;
-        const dy = e.clientY - panStart.y;
+      if (isPanningRef.current) {
+        const dx = clientX - panStartRef.current.x;
+        const dy = clientY - panStartRef.current.y;
 
-        const visibleDuration = viewState.endTime - viewState.startTime;
-        const drawableWidth = Math.max(canvasSize.width - THREAD_HEADER_WIDTH, 1);
+        const vs = viewStateRef.current;
+        const visibleDuration = vs.endTime - vs.startTime;
+        const drawableWidth = Math.max(canvasSizeRef.current.width - THREAD_HEADER_WIDTH, 1);
         const pixelsPerMicrosecond = drawableWidth / Math.max(visibleDuration, 1);
         const timeDelta = -dx / pixelsPerMicrosecond;
 
-        onViewStateChange({
-          ...viewState,
-          startTime: viewState.startTime + timeDelta,
-          endTime: viewState.endTime + timeDelta,
+        onViewStateChangeRef.current({
+          ...vs,
+          startTime: vs.startTime + timeDelta,
+          endTime: vs.endTime + timeDelta,
         });
 
-        setScrollY(Math.max(0, Math.min(totalHeight - canvasSize.height, scrollY - dy)));
-        setPanStart({ x: e.clientX, y: e.clientY });
-      } else if (x > THREAD_HEADER_WIDTH) {
-        const event = findEventAtPosition(x, y);
-        setHoveredEvent(event);
+        const newScrollY = Math.max(0, Math.min(totalHeightRef.current - canvasSizeRef.current.height, scrollYRef.current - dy));
+        setScrollY(newScrollY);
+        panStartRef.current = { x: clientX, y: clientY };
+        setTooltipState(null);
       } else {
-        setHoveredEvent(null);
+        if (rafIdRef.current) return;
+        rafIdRef.current = requestAnimationFrame(() => {
+          rafIdRef.current = 0;
+          const pos = mousePosRef.current;
+          if (pos.x > THREAD_HEADER_WIDTH) {
+            const event = findEventAtPositionRef.current(pos.x, pos.y);
+            hoveredEventRef.current = event;
+            setTooltipState(event ? { event, x: pos.x, y: pos.y } : null);
+          } else {
+            hoveredEventRef.current = null;
+            setTooltipState(null);
+          }
+        });
       }
     },
-    [
-      canvasSize.height,
-      canvasSize.width,
-      findEventAtPosition,
-      isPanning,
-      onViewStateChange,
-      panStart,
-      scrollY,
-      totalHeight,
-      viewState,
-    ]
+    []
   );
 
   const handleMouseUp = useCallback(() => {
-    setIsPanning(false);
+    isPanningRef.current = false;
   }, []);
 
   const handleMouseLeave = useCallback(() => {
-    setIsPanning(false);
-    setHoveredEvent(null);
+    isPanningRef.current = false;
+    hoveredEventRef.current = null;
+    setTooltipState(null);
   }, []);
 
   const handleWheel = useCallback(
@@ -1298,37 +1287,45 @@ export function Timeline({
       const x = e.clientX - rect.left;
 
       if (e.ctrlKey || e.metaKey) {
-        // Zoom
         e.preventDefault();
         const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
-        const mouseTime = pixelToTime(x);
-        const visibleDuration = viewState.endTime - viewState.startTime;
+        const mouseTime = pixelToTimeRef.current(x);
+        const vs = viewStateRef.current;
+        const visibleDuration = vs.endTime - vs.startTime;
         const newDuration = visibleDuration * zoomFactor;
 
-        const drawableWidth = Math.max(canvasSize.width - THREAD_HEADER_WIDTH, 1);
+        const drawableWidth = Math.max(canvasSizeRef.current.width - THREAD_HEADER_WIDTH, 1);
         const mouseRatio = (x - THREAD_HEADER_WIDTH) / drawableWidth;
         const newStartTime = mouseTime - newDuration * mouseRatio;
         const newEndTime = newStartTime + newDuration;
 
-        onViewStateChange({
-          ...viewState,
+        onViewStateChangeRef.current({
+          ...vs,
           startTime: newStartTime,
           endTime: newEndTime,
         });
       } else {
-        // Scroll vertically
-        const newScrollY = Math.max(0, Math.min(totalHeight - canvasSize.height, scrollY + e.deltaY));
-        setScrollY(newScrollY);
+        pendingScrollDeltaRef.current += e.deltaY;
+        if (scrollRafIdRef.current) return;
+        scrollRafIdRef.current = requestAnimationFrame(() => {
+          scrollRafIdRef.current = 0;
+          const delta = pendingScrollDeltaRef.current;
+          pendingScrollDeltaRef.current = 0;
+          setScrollY((prev) => {
+            const next = Math.max(0, Math.min(totalHeightRef.current - canvasSizeRef.current.height, prev + delta));
+            return next;
+          });
+        });
       }
     },
-    [viewState, onViewStateChange, canvasSize, pixelToTime, scrollY, totalHeight]
+    []
   );
 
   return (
     <div
       ref={containerRef}
       className="relative min-h-0 flex-1 overflow-hidden"
-      style={{ cursor: tool === "pan" || isPanning ? "grab" : "default" }}
+      style={{ cursor: tool === "pan" ? "grab" : "default" }}
     >
       <canvas
         ref={canvasRef}
@@ -1340,6 +1337,21 @@ export function Timeline({
         onWheel={handleWheel}
         onContextMenu={(e) => e.preventDefault()}
       />
+
+      {tooltipState && (
+        <div
+          className="pointer-events-none absolute z-10 max-w-[450px] rounded border border-[#999] bg-white px-2 py-1.5 shadow-sm"
+          style={{
+            left: Math.min(tooltipState.x + 15, canvasSize.width - 200),
+            top: Math.max(tooltipState.y - 80, TIME_RULER_HEIGHT + 5),
+          }}
+        >
+          <div className="truncate text-[11px] font-bold text-[#000]">{tooltipState.event.name}</div>
+          <div className="text-[11px] text-[#333]">Duration: {formatTimeShort(tooltipState.event.dur || 0)}</div>
+          <div className="text-[11px] text-[#333]">Category: {tooltipState.event.cat || "N/A"}</div>
+          <div className="text-[11px] text-[#333]">Start: {(tooltipState.event.ts / 1_000_000).toFixed(6)} s</div>
+        </div>
+      )}
 
       {highlightOverlayGeometry && activeEvidenceHighlight && (
         <div
