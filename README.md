@@ -9,23 +9,16 @@ Local-first and portable flame graph viewer and trace agent for inspecting and c
 ## Run It
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/albertoperdomo2/lupa/main/scripts/install.sh | bash
+curl -fsSL https://albertoperdomo.me/lupa/install | bash
 ```
 
-This installs the `lupa` CLI, creates `~/.lupa/.env`, pulls the GHCR image, and starts the app at `http://lupa.localhost:3874`.
-
-If you want the URL without a port:
-
-```bash
-lupa run --port 80
-```
-
-That gives you `http://lupa.localhost`.
+This installs the `lupa` CLI, creates `~/.lupa/.env`, pulls the GHCR image, and starts the app at `http://lupa.lvh.me`.
 
 Useful commands:
 
 ```bash
 lupa status
+lupa update
 lupa logs
 lupa stop
 lupa uninstall
