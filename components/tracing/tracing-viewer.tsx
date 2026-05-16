@@ -78,7 +78,7 @@ import { Minimap } from "./minimap";
 import { SideToolbar } from "./side-toolbar";
 import { StatusBar } from "./status-bar";
 import { Timeline, type TimelineEvidenceHighlight } from "./timeline";
-import { TracePane } from "./trace-pane";
+import { TracePane, TraceInfoBadge } from "./trace-pane";
 
 interface LupaAppProps {
   chatEnabled: boolean;
@@ -539,6 +539,44 @@ function mergeRepoMentions(
   }
 
   return merged;
+}
+
+const FLAME_BARS = [
+  { color: "#f97316", minH: 18, maxH: 38, delay: "0s" },
+  { color: "#8b5cf6", minH: 22, maxH: 44, delay: "0.12s" },
+  { color: "#06b6d4", minH: 14, maxH: 36, delay: "0.24s" },
+  { color: "#f43f5e", minH: 20, maxH: 42, delay: "0.06s" },
+  { color: "#10b981", minH: 16, maxH: 40, delay: "0.18s" },
+  { color: "#6366f1", minH: 24, maxH: 46, delay: "0.3s" },
+  { color: "#f59e0b", minH: 12, maxH: 34, delay: "0.09s" },
+  { color: "#ec4899", minH: 20, maxH: 38, delay: "0.21s" },
+] as const;
+
+function MiniFlameLoader() {
+  return (
+    <div className="flex items-end gap-[3px]">
+      {FLAME_BARS.map((bar, i) => (
+        <div
+          key={i}
+          className="w-[5px] rounded-sm animate-[flame-bar_1.1s_ease-in-out_infinite_alternate]"
+          style={{
+            backgroundColor: bar.color,
+            height: bar.minH,
+            animationDelay: bar.delay,
+            ["--flame-min" as string]: `${bar.minH}px`,
+            ["--flame-max" as string]: `${bar.maxH}px`,
+          }}
+        />
+      ))}
+      <style>{`
+        @keyframes flame-bar {
+          0%   { height: var(--flame-min); opacity: 0.55; }
+          50%  { height: var(--flame-max); opacity: 1; }
+          100% { height: var(--flame-min); opacity: 0.55; }
+        }
+      `}</style>
+    </div>
+  );
 }
 
 export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
@@ -2035,6 +2073,8 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
     []
   );
 
+  const chatAbortRef = useRef<AbortController | null>(null);
+
   const requestTraceChat = useCallback(
     async (
       payload: {
@@ -2059,6 +2099,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
           ...payload,
           stream: true,
         }),
+        signal: chatAbortRef.current?.signal,
       });
 
       if (!response.ok) {
@@ -3288,6 +3329,31 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
     ]
   );
 
+  const preSendStateRef = useRef<{
+    message: string;
+    attachments: TraceChatAttachment[];
+    messageCount: number;
+    responseId: string | null;
+  } | null>(null);
+
+  const handleCancelMessage = useCallback(() => {
+    if (!chatBusy) return;
+    chatAbortRef.current?.abort();
+    chatAbortRef.current = null;
+
+    const saved = preSendStateRef.current;
+    if (saved) {
+      setChatMessages((msgs) => msgs.slice(0, saved.messageCount));
+      setPendingAttachments(saved.attachments);
+      setChatResponseId(saved.responseId);
+      setChatBusy(false);
+      setChatErrorMessage(null);
+      preSendStateRef.current = null;
+    }
+
+    return saved?.message ?? "";
+  }, [chatBusy]);
+
   const handleSendMessage = useCallback(
     async (message: string) => {
       const trimmed = message.trim();
@@ -3296,6 +3362,16 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
 
       const { displayMessage, repoMentions } = extractGitHubMentions(trimmed);
       const nextAttachedRepos = mergeRepoMentions(attachedRepos, repoMentions);
+
+      preSendStateRef.current = {
+        message: trimmed,
+        attachments: [...pendingAttachments],
+        messageCount: chatMessages.length,
+        responseId: chatResponseId,
+      };
+
+      const abortController = new AbortController();
+      chatAbortRef.current = abortController;
 
       setPendingAttachments([]);
       setAttachedRepos(nextAttachedRepos);
@@ -3489,6 +3565,9 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         ]);
         setChatResponseId(latestResponseId);
       } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
         const errorMessage =
           error instanceof Error ? error.message : "Trace chat failed.";
         setChatErrorMessage(errorMessage);
@@ -3506,6 +3585,8 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         }
       } finally {
         setChatBusy(false);
+        chatAbortRef.current = null;
+        preSendStateRef.current = null;
       }
     },
     [
@@ -3517,6 +3598,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
       candidateTrace.selectedEvent,
       candidateTrace.viewState,
       chatBusy,
+      chatMessages.length,
       chatResponseId,
       executeToolCall,
       includeTraceContext,
@@ -3535,8 +3617,9 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
 
   if (!isHydrated) {
     return (
-        <div className="flex h-screen items-center justify-center bg-white text-sm text-[#666]">
-        Loading lupa…
+      <div className="flex h-screen flex-col items-center justify-center gap-5 bg-white">
+        <MiniFlameLoader />
+        <div className="text-xs tracking-wide text-[#999]">loading lupa</div>
       </div>
     );
   }
@@ -3616,6 +3699,10 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
         ) : (
           <div className="flex h-full overflow-hidden">
             <div className="flex min-h-0 flex-1 flex-col">
+              <div className="flex items-center gap-2 border-b border-[#ddd] bg-[#f7f7f7] px-3 py-1.5">
+                <div className="text-[11px] font-medium uppercase tracking-wide text-[#555]">Trace</div>
+                <TraceInfoBadge traceData={singleTrace.traceData} />
+              </div>
               <Minimap
                 traceData={singleTrace.traceData}
                 viewState={singleTrace.viewState}
@@ -3929,6 +4016,7 @@ export function LupaApp({ chatEnabled, chatModel }: LupaAppProps) {
             errorMessage={chatErrorMessage}
             onRemoveAttachment={handleRemoveAttachment}
             onSendMessage={handleSendMessage}
+            onCancelMessage={handleCancelMessage}
             onStartAreaCapture={handleStartAreaCapture}
             onAttachTextFile={handleAttachTextFile}
             onClearHistory={handleClearHistory}
