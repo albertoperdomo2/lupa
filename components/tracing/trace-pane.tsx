@@ -64,7 +64,7 @@ export function TracePane({
 
   if (collapsed) {
     return (
-      <div className="flex h-full items-center justify-center bg-[#f7f7f7] border-r border-[#ddd]">
+      <div className="flex h-full items-center justify-center overflow-hidden bg-[#f7f7f7] border-r border-[#ddd]">
         <button
           type="button"
           onClick={onToggleCollapse}

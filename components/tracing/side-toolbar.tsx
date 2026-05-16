@@ -23,7 +23,7 @@ export function SideToolbar({
   hasData,
 }: SideToolbarProps) {
   return (
-    <div className="flex flex-col items-center gap-0.5 py-1 px-0.5 bg-[#f0f0f0] border-l border-[#ccc] w-7">
+    <div className="flex flex-col items-center gap-0.5 py-1 px-0.5 bg-[#f0f0f0] border-l border-[#ccc] w-7 shrink-0 overflow-hidden">
       <Button
         variant="ghost"
         size="sm"
