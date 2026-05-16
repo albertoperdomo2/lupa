@@ -193,7 +193,7 @@ export function CompareFindingsPanel({
     return (
       <div className="flex h-full flex-col bg-[#fafafa]">
         {onToggleCollapse && (
-          <div className="border-b border-[#d9d9d9] bg-[#f3f3f3] px-3 py-2">
+          <div className="border-b border-[#d9d9d9] bg-[#f3f3f3] px-3 py-1.5">
             <button
               type="button"
               onClick={onToggleCollapse}
@@ -222,7 +222,7 @@ export function CompareFindingsPanel({
 
   return (
     <div className="flex h-full min-w-0 min-h-0 flex-col overflow-hidden bg-[#fafafa]">
-      <div className="border-b border-[#d9d9d9] bg-[#f3f3f3] px-3 py-2">
+      <div className="border-b border-[#d9d9d9] bg-[#f3f3f3] px-3 py-1.5">
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
             {onToggleCollapse ? (
