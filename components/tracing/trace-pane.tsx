@@ -1,11 +1,12 @@
 "use client";
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { ChevronLeft, ChevronRight, Info } from "lucide-react";
 import type { Process, TraceData, TraceEvent, ViewState } from "@/lib/trace-types";
 import { DetailsPanel } from "@/components/tracing/details-panel";
 import { Minimap } from "@/components/tracing/minimap";
 import { SideToolbar } from "@/components/tracing/side-toolbar";
 import { StatusBar } from "@/components/tracing/status-bar";
 import { Timeline, type TimelineEvidenceHighlight } from "@/components/tracing/timeline";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 
 interface TracePaneProps {
   label: string;
@@ -116,7 +117,7 @@ export function TracePane({
         ) : (
           <div className="text-[11px] font-medium uppercase tracking-wide text-[#555]">{label}</div>
         )}
-        <TraceInfoRow traceData={traceData} />
+        <TraceInfoBadge traceData={traceData} />
       </div>
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
@@ -172,37 +173,167 @@ export function TracePane({
 }
 
 function formatBytes(bytes: number): string {
-  if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(0)} TB`;
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(0)} GB`;
-  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(0)} MB`;
+  if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(1)} TB`;
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
   return `${(bytes / 1e3).toFixed(0)} KB`;
 }
 
-function TraceInfoRow({ traceData }: { traceData: TraceData | null }) {
+function formatCudaVersion(v: number): string {
+  const major = Math.floor(v / 1000);
+  const minor = Math.floor((v % 1000) / 10);
+  return minor === 0 ? `${major}.0` : `${major}.${minor}`;
+}
+
+function shortenGpuName(name: string): string {
+  return name.replace(/NVIDIA\s*/i, "").replace(/GeForce\s*/i, "");
+}
+
+export function TraceInfoBadge({ traceData }: { traceData: TraceData | null }) {
   if (!traceData) return null;
 
-  const parts: string[] = [];
-
-  const gpu = traceData.deviceProperties?.[0];
-  if (gpu?.name) {
-    const mem = gpu.totalGlobalMem ? ` · ${formatBytes(gpu.totalGlobalMem)}` : "";
-    parts.push(`${gpu.name}${mem}`);
-  }
-
+  const gpus = traceData.deviceProperties ?? [];
   const dist = traceData.distributedInfo;
-  if (dist && dist.rank != null && dist.world_size != null) {
-    const backend = dist.backend ? ` · ${dist.backend.toUpperCase()}` : "";
-    parts.push(`Rank ${dist.rank}/${dist.world_size}${backend}`);
-  }
+  const meta = traceData.metadata;
+  const hasGpu = gpus.length > 0 && Boolean(gpus[0]?.name);
+  const hasCuda = traceData.cudaDriverVersion != null || traceData.cudaRuntimeVersion != null;
+  const hasDist = dist != null && dist.rank != null;
+  const hasMeta = Boolean(meta?.["cpu-brand"] || meta?.["os-name"]);
+  const hasFlags = Boolean(traceData.withStack || traceData.recordShapes);
 
-  if (traceData.withStack) parts.push("stacks");
-  if (traceData.recordShapes) parts.push("shapes");
-
-  if (parts.length === 0) return null;
+  const uniqueGpuNames = [...new Set(gpus.map((g) => g.name).filter(Boolean))];
+  const chipLabel = uniqueGpuNames.length > 0
+    ? `${gpus.length}× ${shortenGpuName(uniqueGpuNames[0]!)}`
+    : hasDist
+      ? `Rank ${dist!.rank}/${dist!.world_size}`
+      : "Trace info";
 
   return (
-    <div className="mt-0.5 text-[10px] text-[#888] truncate">
-      {parts.join(" · ")}
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className="mt-0.5 flex items-center gap-1 rounded-sm border border-[#ddd] bg-white px-1.5 py-0.5 text-[10px] text-[#666] hover:border-[#bbb] hover:text-[#444] transition-colors cursor-pointer"
+        >
+          <Info className="h-2.5 w-2.5" />
+          <span className="truncate max-w-[180px]">{chipLabel}</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-80 max-h-[70vh] overflow-y-auto bg-white p-0 text-[11px]">
+        {hasGpu && (
+          <div className="border-b border-[#eee] px-3 py-2">
+            <div className="font-semibold text-[10px] uppercase tracking-wide text-[#999] mb-1">
+              GPU{gpus.length > 1 ? `s (${gpus.length})` : ""}
+            </div>
+            {uniqueGpuNames.length === 1 ? (
+              <>
+                <InfoRow label="Device" value={`${gpus.length}× ${gpus[0]!.name!}`} />
+                {gpus[0]!.totalGlobalMem != null && <InfoRow label="VRAM" value={`${formatBytes(gpus[0]!.totalGlobalMem!)} each`} />}
+                {gpus[0]!.computeMajor != null && (
+                  <InfoRow label="Compute" value={`sm_${gpus[0]!.computeMajor}${gpus[0]!.computeMinor ?? 0}`} />
+                )}
+                {gpus[0]!.numSms != null && <InfoRow label="SMs" value={String(gpus[0]!.numSms)} />}
+                {gpus[0]!.sharedMemPerMultiprocessor != null && (
+                  <InfoRow label="SMEM/SM" value={formatBytes(gpus[0]!.sharedMemPerMultiprocessor!)} />
+                )}
+                {gpus[0]!.warpSize != null && <InfoRow label="Warp" value={String(gpus[0]!.warpSize)} />}
+              </>
+            ) : (
+              gpus.map((gpu) => (
+                <div key={gpu.id ?? gpu.name} className="mb-1.5 last:mb-0">
+                  <InfoRow label={`GPU ${gpu.id ?? ""}`} value={gpu.name ?? "Unknown"} />
+                  {gpu.totalGlobalMem != null && <InfoRow label="VRAM" value={formatBytes(gpu.totalGlobalMem)} />}
+                  {gpu.computeMajor != null && (
+                    <InfoRow label="Compute" value={`sm_${gpu.computeMajor}${gpu.computeMinor ?? 0}`} />
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+        )}
+        {hasCuda && (
+          <div className="border-b border-[#eee] px-3 py-2">
+            <div className="font-semibold text-[10px] uppercase tracking-wide text-[#999] mb-1">CUDA</div>
+            {traceData.cudaDriverVersion != null && (
+              <InfoRow label="Driver" value={formatCudaVersion(traceData.cudaDriverVersion)} />
+            )}
+            {traceData.cudaRuntimeVersion != null && (
+              <InfoRow label="Runtime" value={formatCudaVersion(traceData.cudaRuntimeVersion)} />
+            )}
+            {traceData.cuptiVersion != null && (
+              <InfoRow label="CUPTI" value={formatCudaVersion(traceData.cuptiVersion)} />
+            )}
+          </div>
+        )}
+        {hasMeta && meta && (
+          <div className="border-b border-[#eee] px-3 py-2">
+            <div className="font-semibold text-[10px] uppercase tracking-wide text-[#999] mb-1">Host</div>
+            {meta["cpu-brand"] && <InfoRow label="CPU" value={meta["cpu-brand"]} />}
+            {meta["os-name"] && (
+              <InfoRow label="OS" value={`${meta["os-name"]} ${meta["os-version"] ?? ""} ${meta["os-arch"] ?? ""}`.trim()} />
+            )}
+            {meta["physical-memory"] != null && (
+              <InfoRow label="RAM" value={formatBytes(meta["physical-memory"])} />
+            )}
+            {meta["num-cpus"] != null && <InfoRow label="CPUs" value={String(meta["num-cpus"])} />}
+          </div>
+        )}
+        {hasDist && dist && (
+          <div className="border-b border-[#eee] px-3 py-2">
+            <div className="font-semibold text-[10px] uppercase tracking-wide text-[#999] mb-1">Distributed</div>
+            <InfoRow label="Rank" value={`${dist.rank} / ${dist.world_size}`} />
+            {dist.backend && <InfoRow label="Backend" value={dist.backend.toUpperCase()} />}
+            {dist.nccl_version && <InfoRow label="NCCL" value={dist.nccl_version} />}
+            {dist.pg_count != null && <InfoRow label="Groups" value={String(dist.pg_count)} />}
+            {dist.pg_config && dist.pg_config.length > 0 && (
+              <div className="mt-1.5">
+                <div className="text-[10px] text-[#999] mb-0.5">Process Groups</div>
+                {dist.pg_config.slice(0, 8).map((pg) => (
+                  <div key={pg.pg_name} className="flex items-baseline gap-1 py-0.5 text-[10px]">
+                    <span className="font-mono text-[#555]">{pg.pg_desc || pg.pg_name}</span>
+                    <span className="text-[#999]">·</span>
+                    <span className="text-[#888]">{pg.backend_config}</span>
+                    <span className="text-[#999]">·</span>
+                    <span className="text-[#888]">{pg.pg_size} ranks</span>
+                  </div>
+                ))}
+                {dist.pg_config.length > 8 && (
+                  <div className="text-[10px] text-[#999]">+{dist.pg_config.length - 8} more</div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+        <div className="px-3 py-2">
+          <div className="font-semibold text-[10px] uppercase tracking-wide text-[#999] mb-1">Trace</div>
+          <InfoRow label="Events" value={traceData.traceEvents.length.toLocaleString()} />
+          {traceData.schemaVersion != null && (
+            <InfoRow label="Schema" value={`v${traceData.schemaVersion}`} />
+          )}
+          <InfoRow
+            label="Features"
+            value={[
+              traceData.withStack && "stacks",
+              traceData.recordShapes && "shapes",
+            ].filter(Boolean).join(", ") || "none"}
+          />
+          {meta?.["trace-capture-datetime"] && (
+            <InfoRow label="Captured" value={meta["trace-capture-datetime"]} />
+          )}
+          {traceData.traceName && (
+            <InfoRow label="File" value={traceData.traceName.split("/").pop() ?? traceData.traceName} />
+          )}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+function InfoRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline gap-2 py-0.5">
+      <span className="text-[#888] w-14 shrink-0">{label}</span>
+      <span className="text-[#333] font-mono truncate">{value}</span>
     </div>
   );
 }
