@@ -15,6 +15,7 @@ import type {
   BuildViewportSummaryOptions,
   EventInspection,
   IndexedTraceEvent,
+  OperationSemanticCategory,
   TraceAnomalyInspection,
   TraceCallPathSummary,
   TraceChatContext,
@@ -31,6 +32,7 @@ import type {
   VisibleBucketSummary,
   ViewportSummary,
 } from "@/lib/trace-chat";
+import { classifyOperationCategory } from "@/lib/trace-compare";
 import type { TraceRunSourceSummary } from "@/lib/trace-run";
 
 interface RawThreadEvent {
@@ -1410,4 +1412,171 @@ export function buildTraceChatContext(
     currentView,
     comparisonToPrevious,
   };
+}
+
+export interface CategoryBreakdownEntry {
+  category: OperationSemanticCategory;
+  categoryLabel: string;
+  inclusiveTime: number;
+  selfTime: number;
+  count: number;
+  topOperations: string[];
+}
+
+export function buildCategoryBreakdown(
+  traceIndex: TraceIndex,
+  viewState: ViewState | null,
+): CategoryBreakdownEntry[] {
+  const LABELS: Record<OperationSemanticCategory, string> = {
+    compute: "GPU compute",
+    communication: "Communication",
+    memory: "Memory",
+    synchronization: "Synchronization",
+    host_overhead: "Host overhead",
+    other: "Other",
+  };
+
+  const agg = new Map<OperationSemanticCategory, {
+    inclusiveTime: number;
+    selfTime: number;
+    count: number;
+    ops: Map<string, number>;
+  }>();
+
+  const events = viewState
+    ? traceIndex.events.filter((e) =>
+        e.kind === "span" && overlapsRange(e, viewState.startTime, viewState.endTime))
+    : traceIndex.events.filter((e) => e.kind === "span");
+
+  for (const event of events) {
+    const cat = classifyOperationCategory(event.name, event.cat);
+    const entry = agg.get(cat) ?? { inclusiveTime: 0, selfTime: 0, count: 0, ops: new Map() };
+    const spanNode = traceIndex.spanNodeById.get(event.id);
+    entry.inclusiveTime += event.dur;
+    entry.selfTime += spanNode?.selfTime ?? event.dur;
+    entry.count += 1;
+    entry.ops.set(event.name, (entry.ops.get(event.name) ?? 0) + (spanNode?.selfTime ?? event.dur));
+    agg.set(cat, entry);
+  }
+
+  return [...agg.entries()]
+    .map(([category, data]) => ({
+      category,
+      categoryLabel: LABELS[category],
+      inclusiveTime: data.inclusiveTime,
+      selfTime: data.selfTime,
+      count: data.count,
+      topOperations: [...data.ops.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([name]) => name),
+    }))
+    .sort((a, b) => b.selfTime - a.selfTime);
+}
+
+export interface ThreadTimelineEntry {
+  name: string;
+  category: OperationSemanticCategory;
+  startTime: number;
+  endTime: number;
+  duration: number;
+  childCount: number;
+}
+
+export function buildThreadTimeline(
+  traceIndex: TraceIndex,
+  processName: string | null,
+  threadName: string,
+  limit: number,
+): ThreadTimelineEntry[] {
+  const matchingEvents = traceIndex.events.filter((e) => {
+    if (e.kind !== "span") return false;
+    if (e.threadName !== threadName) return false;
+    if (processName && e.processName !== processName) return false;
+    return true;
+  });
+
+  const roots = matchingEvents.filter((e) => {
+    const node = traceIndex.spanNodeById.get(e.id);
+    return node && node.parentId === null;
+  });
+
+  return roots
+    .sort((a, b) => a.ts - b.ts)
+    .slice(0, limit)
+    .map((event) => {
+      const node = traceIndex.spanNodeById.get(event.id);
+      return {
+        name: event.name,
+        category: classifyOperationCategory(event.name, event.cat),
+        startTime: event.ts,
+        endTime: event.endTime,
+        duration: event.dur,
+        childCount: node?.childIds.length ?? 0,
+      };
+    });
+}
+
+export interface CounterTrackSummary {
+  counterName: string;
+  category: string;
+  sampleCount: number;
+  min: number;
+  max: number;
+  avg: number;
+  samples: Array<{ ts: number; value: number }>;
+}
+
+export function inspectCounterTracks(
+  traceIndex: TraceIndex,
+  query: string,
+  startTime: number | null,
+  endTime: number | null,
+  limit: number,
+): CounterTrackSummary[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  const counterEvents = traceIndex.events.filter((e) => {
+    if (e.kind !== "counter") return false;
+    if (normalizedQuery && !e.name.toLowerCase().includes(normalizedQuery)) return false;
+    if (startTime != null && e.ts < startTime) return false;
+    if (endTime != null && e.ts > endTime) return false;
+    return true;
+  });
+
+  const grouped = new Map<string, { cat: string; samples: Array<{ ts: number; value: number }> }>();
+
+  for (const event of counterEvents) {
+    const args = event.args ?? {};
+    for (const [key, val] of Object.entries(args)) {
+      if (typeof val !== "number") continue;
+      const counterKey = `${event.name}/${key}`;
+      const entry = grouped.get(counterKey) ?? { cat: event.cat, samples: [] };
+      entry.samples.push({ ts: event.ts, value: val });
+      grouped.set(counterKey, entry);
+    }
+  }
+
+  return [...grouped.entries()]
+    .map(([name, data]) => {
+      data.samples.sort((a, b) => a.ts - b.ts);
+      const values = data.samples.map((s) => s.value);
+      const sum = values.reduce((acc, v) => acc + v, 0);
+      const maxSamples = 50;
+      const step = data.samples.length > maxSamples
+        ? Math.ceil(data.samples.length / maxSamples)
+        : 1;
+      const sampled = data.samples.filter((_, i) => i % step === 0);
+
+      return {
+        counterName: name,
+        category: data.cat,
+        sampleCount: data.samples.length,
+        min: Math.min(...values),
+        max: Math.max(...values),
+        avg: values.length > 0 ? sum / values.length : 0,
+        samples: sampled,
+      };
+    })
+    .sort((a, b) => b.sampleCount - a.sampleCount)
+    .slice(0, limit);
 }

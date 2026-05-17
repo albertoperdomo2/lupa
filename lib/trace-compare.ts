@@ -3,6 +3,8 @@ import { formatTimeShort, isSpikeEvent } from "@/lib/trace-types";
 import type {
   CompareFindingKind,
   IndexedTraceEvent,
+  OperationSemanticCategory,
+  TraceCategoryFinding,
   TraceCompareFinding,
   TraceCompareLoopSummary,
   TraceCompareMetadata,
@@ -59,6 +61,14 @@ interface ThreadAggregate {
   sampleEventId: string | null;
 }
 
+interface CategoryAggregate {
+  category: OperationSemanticCategory;
+  inclusiveTime: number;
+  selfTime: number;
+  count: number;
+  topOperations: Map<string, number>;
+}
+
 interface TraceAnalysis {
   totals: {
     duration: number;
@@ -74,6 +84,7 @@ interface TraceAnalysis {
   byCallPath: Map<string, OperationAggregate>;
   byThread: Map<string, ThreadAggregate>;
   byGap: Map<string, GapAggregate>;
+  byCategory: Map<OperationSemanticCategory, CategoryAggregate>;
   loops: Map<string, LoopAggregate>;
 }
 
@@ -102,6 +113,82 @@ function createId(prefix: string, value: string): string {
   const suffix = hashString(value);
   const head = normalized.slice(0, 120);
   return `${prefix}:${head}:${suffix}`;
+}
+
+const CATEGORY_LABELS: Record<OperationSemanticCategory, string> = {
+  compute: "GPU compute",
+  communication: "Communication",
+  memory: "Memory",
+  synchronization: "Synchronization",
+  host_overhead: "Host overhead",
+  other: "Other",
+};
+
+export function classifyOperationCategory(
+  name: string,
+  cat: string,
+): OperationSemanticCategory {
+  const lowerName = name.toLowerCase();
+  const lowerCat = cat.toLowerCase();
+
+  if (
+    lowerCat === "kernel" ||
+    lowerName.startsWith("aten::mm") ||
+    lowerName.startsWith("aten::matmul") ||
+    lowerName.startsWith("aten::conv") ||
+    lowerName.startsWith("aten::addmm") ||
+    lowerName.startsWith("aten::bmm") ||
+    lowerName.startsWith("aten::linear") ||
+    lowerName.startsWith("cutlass_") ||
+    lowerName.startsWith("flash_") ||
+    lowerName.startsWith("ampere_") ||
+    lowerName.startsWith("sm80_") ||
+    lowerName.startsWith("sm90_") ||
+    lowerName.startsWith("triton_") ||
+    lowerName.startsWith("compiled") ||
+    lowerName.includes("fxgraph")
+  ) {
+    return "compute";
+  }
+
+  if (
+    lowerName.startsWith("nccl:") ||
+    lowerName.startsWith("c10d::") ||
+    lowerCat === "nccl" ||
+    lowerCat === "communication"
+  ) {
+    return "communication";
+  }
+
+  if (
+    lowerName.includes("memcpy") ||
+    lowerName.includes("cudamalloc") ||
+    lowerName.includes("cudafree") ||
+    lowerName === "aten::to" ||
+    lowerName === "aten::copy_" ||
+    lowerCat === "gpu_memcpy"
+  ) {
+    return "memory";
+  }
+
+  if (
+    lowerName.includes("cudadevicesynchronize") ||
+    lowerName.includes("cudastreamsynchronize") ||
+    lowerName.includes("cudaeventsynchronize") ||
+    lowerName.startsWith("c10::cuda::") ||
+    lowerName.includes("synchronize")
+  ) {
+    return "synchronization";
+  }
+
+  if (
+    lowerName === "cudalaunchkernel" ||
+    (lowerCat === "cuda_runtime" && !lowerName.includes("synchronize"))
+  ) {
+    return "host_overhead";
+  }
+
+  return "other";
 }
 
 function formatMetricValue(value: number, unit: string): string {
@@ -490,6 +577,7 @@ function analyzeTrace(comparedTrace: ComparedTraceInput): TraceAnalysis {
   const byCallPath = new Map<string, OperationAggregate>();
   const byThread = new Map<string, ThreadAggregate>();
   const byGap = new Map<string, GapAggregate>();
+  const byCategory = new Map<OperationSemanticCategory, CategoryAggregate>();
   const loops = new Map<string, LoopAggregate>();
   let gapDuration = 0;
   let gapCount = 0;
@@ -538,6 +626,23 @@ function analyzeTrace(comparedTrace: ComparedTraceInput): TraceAnalysis {
         event.dur,
         node.selfTime
       );
+
+      const opCategory = classifyOperationCategory(event.name, event.cat);
+      const catAgg = byCategory.get(opCategory) ?? {
+        category: opCategory,
+        inclusiveTime: 0,
+        selfTime: 0,
+        count: 0,
+        topOperations: new Map<string, number>(),
+      };
+      catAgg.inclusiveTime += event.dur;
+      catAgg.selfTime += node.selfTime;
+      catAgg.count += 1;
+      catAgg.topOperations.set(
+        event.name,
+        (catAgg.topOperations.get(event.name) ?? 0) + node.selfTime,
+      );
+      byCategory.set(opCategory, catAgg);
 
       const threadKey = `${event.processName} / ${event.threadName}`;
       const threadAggregate = byThread.get(threadKey) ?? {
@@ -656,6 +761,7 @@ function analyzeTrace(comparedTrace: ComparedTraceInput): TraceAnalysis {
     byCallPath,
     byThread,
     byGap,
+    byCategory,
     loops,
   };
 }
@@ -737,6 +843,139 @@ function findingImpactFromMetric(metric: TraceCompareMetricDelta): TraceCompareF
   return "changed";
 }
 
+function categorySemanticWeight(category: OperationSemanticCategory): number {
+  switch (category) {
+    case "compute":
+    case "communication":
+      return 1.5;
+    case "synchronization":
+      return 1.3;
+    case "host_overhead":
+      return 1.2;
+    case "memory":
+      return 1.1;
+    default:
+      return 1.0;
+  }
+}
+
+function computeFindingPriority(
+  metric: TraceCompareMetricDelta,
+  category: OperationSemanticCategory,
+  traceDuration: number,
+): number {
+  const absDelta = Math.abs(metric.normalizedDelta);
+  const fractionOfTrace = traceDuration > 0 ? absDelta / traceDuration : 0;
+  const weight = categorySemanticWeight(category);
+
+  let clarityBonus = 0;
+  const absPct = Math.abs(metric.normalizedDeltaPercent ?? 0);
+  if (absPct > 10 && absDelta > 1000) {
+    clarityBonus = absDelta * 0.15;
+  }
+
+  return (absDelta + fractionOfTrace * traceDuration * 0.3 + clarityBonus) * weight;
+}
+
+function topOperationNames(ops: Map<string, number>, limit: number): string[] {
+  return [...ops.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([name]) => name);
+}
+
+function buildCategorySummaryFindings(
+  baselineAnalysis: TraceAnalysis,
+  candidateAnalysis: TraceAnalysis,
+  normalization: TraceNormalizationConfig,
+): TraceCategoryFinding[] {
+  const categories: OperationSemanticCategory[] = [
+    "compute", "communication", "memory", "synchronization", "host_overhead", "other",
+  ];
+  const results: TraceCategoryFinding[] = [];
+  const totalDelta = candidateAnalysis.totals.duration - baselineAnalysis.totals.duration;
+
+  for (const cat of categories) {
+    const baselineCat = baselineAnalysis.byCategory.get(cat);
+    const candidateCat = candidateAnalysis.byCategory.get(cat);
+    if (!baselineCat && !candidateCat) continue;
+
+    const baselineSelfTime = baselineCat?.selfTime ?? 0;
+    const candidateSelfTime = candidateCat?.selfTime ?? 0;
+    const metric = buildMetricDelta(
+      `category:${cat}`,
+      CATEGORY_LABELS[cat],
+      "us",
+      baselineSelfTime,
+      candidateSelfTime,
+      normalization,
+    );
+
+    if (Math.abs(metric.normalizedDelta) < 0.00001) continue;
+
+    const maxDuration = Math.max(
+      baselineAnalysis.totals.duration,
+      candidateAnalysis.totals.duration,
+    );
+    const fractionOfTrace = maxDuration > 0
+      ? Math.abs(metric.normalizedDelta) / (maxDuration / Math.max(normalization.baselineDenominator, 1))
+      : 0;
+    const relativeChange = Math.abs(metric.normalizedDeltaPercent ?? 0);
+
+    if (fractionOfTrace < 0.01 && relativeChange < 5) continue;
+
+    results.push({
+      category: cat,
+      categoryLabel: CATEGORY_LABELS[cat],
+      impact: findingImpactFromMetric(metric),
+      summaryDelta: metric,
+      topFindings: [],
+    });
+  }
+
+  return results.sort((a, b) =>
+    Math.abs(b.summaryDelta.normalizedDelta) - Math.abs(a.summaryDelta.normalizedDelta),
+  );
+}
+
+function extractOperationRoot(key: string): string {
+  const arrowIndex = key.lastIndexOf(" -> ");
+  return arrowIndex >= 0 ? key.slice(arrowIndex + 4) : key.split(" | ")[0];
+}
+
+function deduplicateFindingsByOperation(
+  findings: TraceCompareFinding[],
+): TraceCompareFinding[] {
+  const byRoot = new Map<string, TraceCompareFinding[]>();
+
+  for (const finding of findings) {
+    const root = extractOperationRoot(finding.title);
+    const group = byRoot.get(root);
+    if (group) {
+      group.push(finding);
+    } else {
+      byRoot.set(root, [finding]);
+    }
+  }
+
+  const result: TraceCompareFinding[] = [];
+
+  for (const group of byRoot.values()) {
+    group.sort((a, b) => b.priority - a.priority);
+    const best = group[0];
+    const absorbedKinds = group
+      .slice(1)
+      .map((f) => f.kind)
+      .filter((k) => k !== best.kind);
+    if (absorbedKinds.length > 0) {
+      best.labels = [...new Set([...best.labels, ...absorbedKinds])];
+    }
+    result.push(best);
+  }
+
+  return result.sort((a, b) => b.priority - a.priority);
+}
+
 function buildAggregateFindings(
   kind: CompareFindingKind,
   baselineTrace: ComparedTraceInput,
@@ -752,7 +991,8 @@ function buildAggregateFindings(
     | Map<string, ThreadAggregate>,
   selector: (value: OperationAggregate | GapAggregate | ThreadAggregate) => number,
   unit: string,
-  limit: number
+  limit: number,
+  traceDuration: number,
 ): TraceCompareFinding[] {
   const keys = new Set([...baselineMap.keys(), ...candidateMap.keys()]);
   const findings: TraceCompareFinding[] = [];
@@ -804,25 +1044,32 @@ function buildAggregateFindings(
           `${label} changed by ${formatTimeShort(Math.abs(metric.delta))}.`
         );
 
+    const opCategory = classifyOperationCategory(label, "");
+    const categoryLabel = CATEGORY_LABELS[opCategory];
+    const normLabel = normalization.label === "total trace" ? "overall" : normalization.label;
+    const absDelta = formatMetricValue(Math.abs(metric.normalizedDelta), unit);
+    const pctStr = metric.normalizedDeltaPercent != null
+      ? ` (${metric.normalizedDeltaPercent >= 0 ? "+" : ""}${metric.normalizedDeltaPercent.toFixed(1)}%)`
+      : "";
+
     findings.push({
       id: createId("finding", `${kind}:${key}`),
       kind,
       title: label,
-      summary:
-        metric.normalizedDelta < 0
-          ? `Candidate reduced ${label} by ${formatMetricValue(Math.abs(metric.normalizedDelta), unit)} ${normalization.label === "total trace" ? "overall" : normalization.label}.`
-          : `Candidate increased ${label} by ${formatMetricValue(Math.abs(metric.normalizedDelta), unit)} ${normalization.label === "total trace" ? "overall" : normalization.label}.`,
+      summary: metric.normalizedDelta < 0
+        ? `${categoryLabel}: ${label} reduced by ${absDelta} ${normLabel}${pctStr}.`
+        : `${categoryLabel}: ${label} increased by ${absDelta} ${normLabel}${pctStr}.`,
       explanation: [
         `Baseline: ${formatMetricValue(metric.baseline.normalized, unit)} ${normalization.label}.`,
         `Candidate: ${formatMetricValue(metric.candidate.normalized, unit)} ${normalization.label}.`,
         metric.normalizedDeltaPercent == null
           ? "Relative percent change is unavailable because the baseline value is zero."
-          : `Normalized delta: ${metric.normalizedDeltaPercent.toFixed(1)}%.`,
+          : `Delta: ${metric.normalizedDeltaPercent.toFixed(1)}%.`,
       ].join(" "),
       impact: findingImpactFromMetric(metric),
-      priority: Math.abs(metric.normalizedDelta),
+      priority: computeFindingPriority(metric, opCategory, traceDuration),
       metric,
-      labels: [kind, normalization.label],
+      labels: [kind, normalization.label, opCategory],
       baselineSample:
         baselineValue && "label" in baselineValue
           ? baselineValue.label
@@ -978,6 +1225,11 @@ export function buildTraceCompareReport(input: {
     ),
   ];
 
+  const traceDuration = Math.max(
+    baselineAnalysis.totals.duration,
+    candidateAnalysis.totals.duration,
+  );
+
   const hotspotFindings = buildAggregateFindings(
     "hotspot",
     baselineTrace,
@@ -987,7 +1239,8 @@ export function buildTraceCompareReport(input: {
     candidateAnalysis.byHotspot,
     (value) => (value as OperationAggregate).inclusiveTime,
     "us",
-    8
+    8,
+    traceDuration,
   );
   const signatureFindings = buildAggregateFindings(
     "signature",
@@ -998,7 +1251,8 @@ export function buildTraceCompareReport(input: {
     candidateAnalysis.bySignature,
     (value) => (value as OperationAggregate).inclusiveTime,
     "us",
-    8
+    8,
+    traceDuration,
   );
   const selfTimeFindings = buildAggregateFindings(
     "self_time",
@@ -1009,7 +1263,8 @@ export function buildTraceCompareReport(input: {
     candidateAnalysis.bySelfTime,
     (value) => (value as OperationAggregate).selfTime,
     "us",
-    8
+    8,
+    traceDuration,
   );
   const spikeFindings = buildAggregateFindings(
     "spike",
@@ -1020,7 +1275,8 @@ export function buildTraceCompareReport(input: {
     candidateAnalysis.bySpike,
     (value) => (value as OperationAggregate).count,
     "count",
-    8
+    8,
+    traceDuration,
   );
   const gapFindings = buildAggregateFindings(
     "gap",
@@ -1031,7 +1287,8 @@ export function buildTraceCompareReport(input: {
     candidateAnalysis.byGap,
     (value) => (value as GapAggregate).totalGapDuration,
     "us",
-    6
+    6,
+    traceDuration,
   );
   const callPathFindings = buildAggregateFindings(
     "call_path",
@@ -1042,7 +1299,8 @@ export function buildTraceCompareReport(input: {
     candidateAnalysis.byCallPath,
     (value) => (value as OperationAggregate).selfTime,
     "us",
-    6
+    6,
+    traceDuration,
   );
   const threadFindings = buildAggregateFindings(
     "thread",
@@ -1053,7 +1311,8 @@ export function buildTraceCompareReport(input: {
     candidateAnalysis.byThread,
     (value) => (value as ThreadAggregate).selfTime,
     "us",
-    6
+    6,
+    traceDuration,
   );
   const loopData = buildLoopFindings(
     baselineTrace,
@@ -1064,7 +1323,7 @@ export function buildTraceCompareReport(input: {
     6
   );
 
-  const findings = [
+  const allFindings = deduplicateFindingsByOperation([
     ...hotspotFindings,
     ...signatureFindings,
     ...selfTimeFindings,
@@ -1073,11 +1332,21 @@ export function buildTraceCompareReport(input: {
     ...callPathFindings,
     ...threadFindings,
     ...loopData.findings,
-  ]
-    .sort((a, b) => b.priority - a.priority)
-    .slice(0, 18);
+  ]).slice(0, 12);
 
-  const representativeRegions = findings
+  const categoryFindings = buildCategorySummaryFindings(
+    baselineAnalysis,
+    candidateAnalysis,
+    normalization,
+  );
+
+  for (const catFinding of categoryFindings) {
+    catFinding.topFindings = allFindings
+      .filter((f) => f.labels.includes(catFinding.category))
+      .slice(0, 4);
+  }
+
+  const representativeRegions = allFindings
     .flatMap((finding) => finding.evidence)
     .slice(0, 16);
 
@@ -1132,7 +1401,8 @@ export function buildTraceCompareReport(input: {
     winner,
     headline,
     summaryMetrics,
-    findings,
+    findings: allFindings,
+    categoryFindings,
     hotspotFindings: [...hotspotFindings, ...signatureFindings, ...selfTimeFindings]
       .sort((a, b) => b.priority - a.priority)
       .slice(0, 10),
@@ -1174,6 +1444,17 @@ export function buildTraceCompareReportExport(report: TraceCompareReport): strin
     }),
     "",
   ];
+
+  if (report.categoryFindings.length > 0) {
+    lines.push("## Category Breakdown");
+    lines.push("");
+    for (const cat of report.categoryFindings) {
+      const delta = formatMetricValue(Math.abs(cat.summaryDelta.normalizedDelta), cat.summaryDelta.unit);
+      const pct = formatPercentValue(cat.summaryDelta.normalizedDeltaPercent);
+      lines.push(`- **${cat.categoryLabel}**: ${cat.impact} by ${delta} (${pct})`);
+    }
+    lines.push("");
+  }
 
   appendFindingSection(lines, "Top Findings", report.findings, 6);
   appendFindingSection(lines, "Spikes And Gaps", report.spikeFindings, 4);
@@ -1219,4 +1500,86 @@ export function findCompareRegion(
     report.findings.flatMap((finding) => finding.evidence).find((region) => region.id === regionId) ??
     null
   );
+}
+
+export interface OperationChildComparison {
+  baselineInstances: number;
+  candidateInstances: number;
+  baselineTotalDuration: number;
+  candidateTotalDuration: number;
+  childComparison: Array<{
+    name: string;
+    baselineTime: number;
+    candidateTime: number;
+    delta: number;
+    deltaPercent: number | null;
+  }>;
+}
+
+function aggregateChildrenByName(
+  index: TraceIndex,
+  operationName: string,
+): { instances: number; totalDuration: number; children: Map<string, number> } {
+  const children = new Map<string, number>();
+  let instances = 0;
+  let totalDuration = 0;
+
+  for (const event of index.events) {
+    if (event.name !== operationName || event.kind !== "span") continue;
+    const node = index.spanNodeById.get(event.id);
+    if (!node) continue;
+
+    instances += 1;
+    totalDuration += event.dur;
+
+    for (const childId of node.childIds) {
+      const childEvent = index.eventById.get(childId);
+      if (!childEvent) continue;
+      children.set(
+        childEvent.name,
+        (children.get(childEvent.name) ?? 0) + childEvent.dur,
+      );
+    }
+  }
+
+  return { instances, totalDuration, children };
+}
+
+export function compareOperationChildren(
+  baselineIndex: TraceIndex,
+  candidateIndex: TraceIndex,
+  operationName: string,
+  limit: number,
+): OperationChildComparison {
+  const baseline = aggregateChildrenByName(baselineIndex, operationName);
+  const candidate = aggregateChildrenByName(candidateIndex, operationName);
+
+  const allChildNames = new Set([
+    ...baseline.children.keys(),
+    ...candidate.children.keys(),
+  ]);
+
+  const childComparison = [...allChildNames]
+    .map((name) => {
+      const baselineTime = baseline.children.get(name) ?? 0;
+      const candidateTime = candidate.children.get(name) ?? 0;
+      const delta = candidateTime - baselineTime;
+      return {
+        name,
+        baselineTime,
+        candidateTime,
+        delta,
+        deltaPercent: baselineTime > 0 ? (delta / baselineTime) * 100 : null,
+      };
+    })
+    .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+    .slice(0, limit);
+
+  return {
+    baselineInstances: baseline.instances,
+    candidateInstances: candidate.instances,
+    baselineTotalDuration: baseline.totalDuration,
+    candidateTotalDuration: candidate.totalDuration,
+    childComparison,
+  };
 }

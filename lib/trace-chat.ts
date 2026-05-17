@@ -26,6 +26,12 @@ export type TraceChatToolName =
   | "compare_call_paths"
   | "compare_anomalies"
   | "search_compare_findings"
+  | "list_category_breakdown"
+  | "list_thread_timeline"
+  | "compare_operation_children"
+  | "inspect_counters"
+  | "clone_repo"
+  | "cleanup_repo_clone"
   | "search_repo_paths"
   | "list_repo_directory"
   | "read_repo_file";
@@ -315,6 +321,22 @@ export type CompareFindingKind =
   | "loop"
   | "thread";
 
+export type OperationSemanticCategory =
+  | "compute"
+  | "communication"
+  | "memory"
+  | "synchronization"
+  | "host_overhead"
+  | "other";
+
+export interface TraceCategoryFinding {
+  category: OperationSemanticCategory;
+  categoryLabel: string;
+  impact: "improved" | "regressed" | "changed" | "mixed";
+  summaryDelta: TraceCompareMetricDelta;
+  topFindings: TraceCompareFinding[];
+}
+
 export interface TraceCompareMetadata {
   traceId: string;
   label: string;
@@ -398,6 +420,7 @@ export interface TraceCompareReport {
   headline: string;
   summaryMetrics: TraceCompareMetricDelta[];
   findings: TraceCompareFinding[];
+  categoryFindings: TraceCategoryFinding[];
   hotspotFindings: TraceCompareFinding[];
   spikeFindings: TraceCompareFinding[];
   callPathFindings: TraceCompareFinding[];

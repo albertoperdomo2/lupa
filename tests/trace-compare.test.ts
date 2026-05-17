@@ -98,6 +98,7 @@ describe("buildTraceCompareReportExport", () => {
       loopFindings: [],
       representativeRegions: [],
       topChangedLoops: [],
+      categoryFindings: [],
       caveats: [],
     };
 

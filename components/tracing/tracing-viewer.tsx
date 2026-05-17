@@ -32,7 +32,10 @@ import {
   buildTraceDiffSummary,
   buildTraceIndex,
   buildTraceSnapshot,
+  buildCategoryBreakdown,
+  buildThreadTimeline,
   buildViewportSummary,
+  inspectCounterTracks,
   inspectTraceAnomaly,
   inspectTraceEvent,
   normalizeTraceEvents,
@@ -60,6 +63,7 @@ import {
 import {
   buildTraceCompareReport,
   buildTraceCompareReportExport,
+  compareOperationChildren,
   findCompareFinding,
   findCompareRegion,
 } from "@/lib/trace-compare";
@@ -607,6 +611,9 @@ export function LupaApp({ chatEnabled, chatModel, chatProvider }: LupaAppProps) 
   const [chatErrorMessage, setChatErrorMessage] = useState<string | null>(null);
   const [chatResponseId, setChatResponseId] = useState<string | null>(null);
   const [attachedRepos, setAttachedRepos] = useState<GitHubRepoMention[]>([]);
+  const [activeClones, setActiveClones] = useState<Map<string, { cloneId: string; repoUrl: string; clonePath: string }>>(
+    () => new Map(),
+  );
   const [singleTimelineApi, setSingleTimelineApi] = useState<TimelineApi | null>(null);
   const [baselineTimelineApi, setBaselineTimelineApi] = useState<TimelineApi | null>(null);
   const [candidateTimelineApi, setCandidateTimelineApi] = useState<TimelineApi | null>(null);
@@ -687,6 +694,18 @@ export function LupaApp({ chatEnabled, chatModel, chatProvider }: LupaAppProps) 
     () => buildProcessMap(candidateTrace.traceData, candidateNormalized),
     [candidateTrace.traceData, candidateNormalized]
   );
+
+  useEffect(() => {
+    const cleanupClones = () => {
+      if (activeClones.size === 0) return;
+      navigator.sendBeacon(
+        "/api/repo-clone",
+        JSON.stringify({ action: "cleanup_all" }),
+      );
+    };
+    window.addEventListener("beforeunload", cleanupClones);
+    return () => window.removeEventListener("beforeunload", cleanupClones);
+  }, [activeClones]);
 
   useEffect(() => {
     if (typeof window === "undefined" || hasRestoredPersistentChatRef.current) return;
@@ -2044,6 +2063,7 @@ export function LupaApp({ chatEnabled, chatModel, chatProvider }: LupaAppProps) 
     async (payload: {
       action: "snapshot" | "search_paths" | "list_directory" | "read_file";
       repo: GitHubRepoMention;
+      clonePath?: string;
       query?: string;
       path?: string;
       limit?: number;
@@ -2919,6 +2939,7 @@ export function LupaApp({ chatEnabled, chatModel, chatProvider }: LupaAppProps) 
               normalization: deepCompareReport.normalization,
               winner: deepCompareReport.winner,
               summaryMetrics: deepCompareReport.summaryMetrics,
+              categoryFindings: deepCompareReport.categoryFindings,
               findings: deepCompareReport.findings.slice(0, limit),
               anomalyComparisons:
                 baselineTraceIndex && candidateTraceIndex
@@ -3207,6 +3228,221 @@ export function LupaApp({ chatEnabled, chatModel, chatProvider }: LupaAppProps) 
           };
         }
 
+        case "list_category_breakdown": {
+          const scope = toolCall.arguments.scope === "view" ? "view" : "trace";
+          const target = getTarget(toolCall.arguments.trace_role);
+          if (!target.traceIndex) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to list category breakdown but no trace is loaded.",
+              output: { success: false, error: `No ${target.label} is currently loaded.` },
+            };
+          }
+          const breakdown = buildCategoryBreakdown(
+            target.traceIndex,
+            scope === "view" ? target.runtimeState.viewState : null,
+          );
+          return {
+            runtime: nextRuntime,
+            logMessage: `Assistant listed category breakdown for ${target.label} (${scope}).`,
+            output: { scope, breakdown },
+          };
+        }
+
+        case "list_thread_timeline": {
+          const threadName =
+            typeof toolCall.arguments.thread_name === "string"
+              ? toolCall.arguments.thread_name
+              : "";
+          const processName =
+            typeof toolCall.arguments.process_name === "string"
+              ? toolCall.arguments.process_name
+              : null;
+          const limit = clampNumber(toolCall.arguments.limit, 1, 100, 20);
+          const target = getTarget(toolCall.arguments.trace_role);
+          if (!target.traceIndex) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to list thread timeline but no trace is loaded.",
+              output: { success: false, error: `No ${target.label} is currently loaded.` },
+            };
+          }
+          const timeline = buildThreadTimeline(target.traceIndex, processName, threadName, limit);
+          return {
+            runtime: nextRuntime,
+            logMessage: `Assistant listed thread timeline for "${threadName}" in ${target.label}.`,
+            output: { threadName, processName, entryCount: timeline.length, entries: timeline },
+          };
+        }
+
+        case "compare_operation_children": {
+          const operationName =
+            typeof toolCall.arguments.operation_name === "string"
+              ? toolCall.arguments.operation_name
+              : "";
+          const limit = clampNumber(toolCall.arguments.limit, 1, 30, 12);
+          if (nextRuntime.mode !== "deep" || !baselineTraceIndex || !candidateTraceIndex) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to compare operation children but Deep Mode is not available.",
+              output: { success: false, error: "Deep Mode is not available." },
+            };
+          }
+          const comparison = compareOperationChildren(
+            baselineTraceIndex,
+            candidateTraceIndex,
+            operationName,
+            limit,
+          );
+          return {
+            runtime: nextRuntime,
+            logMessage: `Assistant compared children of "${operationName}" across baseline and candidate.`,
+            output: comparison,
+          };
+        }
+
+        case "inspect_counters": {
+          const query =
+            typeof toolCall.arguments.query === "string"
+              ? toolCall.arguments.query
+              : "";
+          const startTime =
+            typeof toolCall.arguments.start_time_us === "number"
+              ? toolCall.arguments.start_time_us
+              : null;
+          const endTime =
+            typeof toolCall.arguments.end_time_us === "number"
+              ? toolCall.arguments.end_time_us
+              : null;
+          const limit = clampNumber(toolCall.arguments.limit, 1, 20, 8);
+          const target = getTarget(toolCall.arguments.trace_role);
+          if (!target.traceIndex) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to inspect counters but no trace is loaded.",
+              output: { success: false, error: `No ${target.label} is currently loaded.` },
+            };
+          }
+          const counters = inspectCounterTracks(target.traceIndex, query, startTime, endTime, limit);
+          return {
+            runtime: nextRuntime,
+            logMessage: `Assistant inspected ${counters.length} counter tracks in ${target.label}.`,
+            output: { query, trackCount: counters.length, tracks: counters },
+          };
+        }
+
+        case "clone_repo": {
+          const repoId =
+            typeof toolCall.arguments.repo_id === "string"
+              ? toolCall.arguments.repo_id
+              : "";
+          const repo = getRepoMention(repoId);
+          if (!repo) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to clone a repo that is not attached.",
+              output: { success: false, error: `Repo "${repoId}" is not attached.` },
+            };
+          }
+
+          const existing = [...activeClones.values()].find((c) => c.repoUrl === repo.url);
+          if (existing) {
+            return {
+              runtime: nextRuntime,
+              logMessage: `Repo ${repo.url} is already cloned.`,
+              output: { success: true, alreadyCloned: true, cloneId: existing.cloneId },
+            };
+          }
+
+          const cloneResponse = await fetch("/api/repo-clone", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "clone", repoUrl: repo.url }),
+          });
+          if (!cloneResponse.ok) {
+            const errorText = await cloneResponse.text();
+            return {
+              runtime: nextRuntime,
+              logMessage: `Failed to clone ${repo.url}.`,
+              output: { success: false, error: errorText },
+            };
+          }
+
+          const cloneResult = (await cloneResponse.json()) as {
+            cloneId: string;
+            owner: string;
+            repo: string;
+            branch: string;
+            clonePath: string;
+            alreadyCloned: boolean;
+          };
+
+          setActiveClones((prev) => {
+            const next = new Map(prev);
+            next.set(repo.url, {
+              cloneId: cloneResult.cloneId,
+              repoUrl: repo.url,
+              clonePath: cloneResult.clonePath,
+            });
+            return next;
+          });
+
+          return {
+            runtime: nextRuntime,
+            logMessage: `Cloned ${repo.url} to local temp directory.`,
+            output: {
+              success: true,
+              cloneId: cloneResult.cloneId,
+              owner: cloneResult.owner,
+              repo: cloneResult.repo,
+              branch: cloneResult.branch,
+              message: "Repository cloned successfully. Subsequent file operations will use the local clone for faster access.",
+            },
+          };
+        }
+
+        case "cleanup_repo_clone": {
+          const repoId =
+            typeof toolCall.arguments.repo_id === "string"
+              ? toolCall.arguments.repo_id
+              : "";
+          const repo = getRepoMention(repoId);
+          if (!repo) {
+            return {
+              runtime: nextRuntime,
+              logMessage: "Assistant tried to clean up a clone for a repo that is not attached.",
+              output: { success: false, error: `Repo "${repoId}" is not attached.` },
+            };
+          }
+
+          const clone = activeClones.get(repo.url);
+          if (!clone) {
+            return {
+              runtime: nextRuntime,
+              logMessage: `No clone found for ${repo.url}.`,
+              output: { success: false, error: "No active clone for this repo." },
+            };
+          }
+
+          await fetch("/api/repo-clone", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "cleanup", cloneId: clone.cloneId }),
+          });
+
+          setActiveClones((prev) => {
+            const next = new Map(prev);
+            next.delete(repo.url);
+            return next;
+          });
+
+          return {
+            runtime: nextRuntime,
+            logMessage: `Cleaned up clone for ${repo.url}.`,
+            output: { success: true, message: "Clone removed." },
+          };
+        }
+
         case "search_repo_paths": {
           const repoId =
             typeof toolCall.arguments.repo_id === "string"
@@ -3227,16 +3463,18 @@ export function LupaApp({ chatEnabled, chatModel, chatProvider }: LupaAppProps) 
           const query =
             typeof toolCall.arguments.query === "string" ? toolCall.arguments.query : "";
           const limit = clampNumber(toolCall.arguments.limit, 1, 40, 12);
+          const clone = activeClones.get(repo.url);
           const output = await requestRepoContext({
             action: "search_paths",
             repo,
+            clonePath: clone?.clonePath,
             query,
             limit,
           });
 
           return {
             runtime: nextRuntime,
-            logMessage: `Assistant searched ${repo.url} for matching file paths.`,
+            logMessage: `Assistant searched ${repo.url} for matching file paths${clone ? " (local clone)" : ""}.`,
             output,
           };
         }
@@ -3260,15 +3498,17 @@ export function LupaApp({ chatEnabled, chatModel, chatProvider }: LupaAppProps) 
 
           const path =
             typeof toolCall.arguments.path === "string" ? toolCall.arguments.path : "";
+          const clone = activeClones.get(repo.url);
           const output = await requestRepoContext({
             action: "list_directory",
             repo,
+            clonePath: clone?.clonePath,
             path,
           });
 
           return {
             runtime: nextRuntime,
-            logMessage: `Assistant listed ${path || "/"} in ${repo.url}.`,
+            logMessage: `Assistant listed ${path || "/"} in ${repo.url}${clone ? " (local clone)" : ""}.`,
             output,
           };
         }
@@ -3292,15 +3532,17 @@ export function LupaApp({ chatEnabled, chatModel, chatProvider }: LupaAppProps) 
 
           const path =
             typeof toolCall.arguments.path === "string" ? toolCall.arguments.path : "";
+          const clone = activeClones.get(repo.url);
           const output = await requestRepoContext({
             action: "read_file",
             repo,
+            clonePath: clone?.clonePath,
             path,
           });
 
           return {
             runtime: nextRuntime,
-            logMessage: `Assistant read ${path} from ${repo.url}.`,
+            logMessage: `Assistant read ${path} from ${repo.url}${clone ? " (local clone)" : ""}.`,
             output,
           };
         }

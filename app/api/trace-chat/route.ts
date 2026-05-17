@@ -61,7 +61,7 @@ Causal reasoning:
 Comparison analysis:
 - Baseline and candidate are equivalent workloads (same model, same task). Differences come from config changes, code changes, or environment changes.
 - NEVER just list findings or repeat tool output. The user can already see the findings in the UI. Your value is connecting them into a causal explanation they could not derive themselves.
-- Structure comparison answers as: (1) overall verdict with magnitude, (2) root cause analysis explaining WHY, (3) category-level breakdown if the shifts are meaningful, (4) key supporting findings with specific evidence (tensor shapes, kernel config, etc.), (5) what likely caused the difference.
+- Structure comparison answers as: (1) overall verdict with magnitude, (2) category-level breakdown from categoryFindings showing which areas improved/regressed (compute, communication, memory, sync, host), (3) root cause analysis drilling into the top findings within each changed category, (4) key supporting evidence (tensor shapes, kernel config, etc.), (5) what likely caused the difference.
 - After getting deep compare findings, synthesize them into a coherent narrative. If you cannot explain WHY, drill deeper with inspect_compare_finding and inspect_event until you can.
 - If compute and communication shift in opposite directions, explain the tradeoff (e.g., tensor parallelism splits compute but adds communication).
 - Consider what configuration change would produce the observed pattern: batch size changes affect compute uniformly; parallelism changes shift the compute/communication ratio; precision changes affect kernel time and memory bandwidth.
@@ -90,15 +90,21 @@ Tool reference:
 - inspect_current_view: structured summary of the visible viewport (required: limit, trace_role).
 - focus_event / set_view_range / fit_to_trace / clear_selection: viewport manipulation tools.
 - compare_with_previous: lightweight diff when a new trace replaces the old one (not Deep Mode).
-- run_deep_compare: deterministic Deep Mode report — returns a HIGH-LEVEL SUMMARY of findings. This is a STARTING POINT, never the final answer. Always drill deeper after this.
+- run_deep_compare: deterministic Deep Mode report — returns category-level breakdown (compute, communication, memory, sync, host overhead) and top deduplicated findings. This is a STARTING POINT, never the final answer. Use categoryFindings to understand the high-level story, then drill deeper into specific operations.
 - inspect_compare_finding: detailed evidence for one finding (required: finding_id). Use after run_deep_compare.
 - compare_hotspots / compare_call_paths / compare_spikes / compare_anomalies: filtered subsets of Deep Mode findings.
 - search_compare_findings: full-text search across all findings.
 - focus_compare_region: zoom into evidence regions from a finding.
-- search_repo_paths / list_repo_directory / read_repo_file: inspect attached GitHub repos.
+- list_category_breakdown: time breakdown by semantic category (compute, communication, memory, sync, host overhead) for a trace or viewport.
+- list_thread_timeline: chronological sequence of root operations on a thread — shows the execution structure.
+- compare_operation_children: compare the children of a named operation between baseline and candidate — the "why is this operation slower/faster" tool.
+- inspect_counters: counter track values (GPU utilization, memory, etc.) in a time range — use to correlate metrics with events.
+- clone_repo: clone an attached GitHub repo to a temp directory for faster access. ALWAYS ask the user for permission before cloning. When a repo is cloned, subsequent search/list/read operations use the local copy automatically.
+- cleanup_repo_clone: remove a cloned repo from temp storage.
+- search_repo_paths / list_repo_directory / read_repo_file: inspect attached GitHub repos (uses local clone if available, otherwise GitHub API).
 
 Comparison investigation workflow (MANDATORY — do not skip steps):
-  Step 1: run_deep_compare to get the overall report and identify top findings.
+  Step 1: run_deep_compare to get the overall report — read categoryFindings first for the high-level story, then examine top findings for specifics.
   Step 2: list_hotspots with trace_role="baseline" then list_hotspots with trace_role="candidate" to understand what dominates each trace independently.
   Step 3: For the top changed operations from step 1-2, call inspect_event on each one in BOTH traces (trace_role="baseline" then trace_role="candidate"). Read children, child hotspots, call paths, self-time, and args. For compiled graphs (CompiledFxGraph, torch.compile, triton kernels), the children reveal what the graph actually computes — the graph name alone is opaque and meaningless.
   Step 4: If needed, use inspect_compare_finding, compare_call_paths, or compare_anomalies to gather additional evidence on specific findings.
@@ -564,6 +570,154 @@ const TOOL_DEFINITIONS = [
         },
       },
       required: ["kind", "limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_category_breakdown",
+    description:
+      "Return time breakdown by semantic category (GPU compute, communication, memory, synchronization, host overhead, other) for the full trace or current viewport.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        scope: {
+          type: "string",
+          enum: ["trace", "view"],
+          description: '"trace" for all events, "view" for only visible events.',
+        },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: 'Which trace to analyze. Use "baseline" or "candidate" in Deep Mode.',
+        },
+      },
+      required: ["scope", "trace_role"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_thread_timeline",
+    description:
+      "Return the chronological sequence of top-level (root) operations on a specific thread, showing the execution structure.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        thread_name: {
+          type: "string",
+          description: "Exact thread name to inspect.",
+        },
+        process_name: {
+          type: "string",
+          description: "Optional process name to disambiguate threads with the same name across processes.",
+        },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: 'Which trace. Use "baseline" or "candidate" in Deep Mode.',
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of root spans to return.",
+        },
+      },
+      required: ["thread_name", "trace_role", "limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "compare_operation_children",
+    description:
+      "Compare the children breakdown of a specific operation across baseline and candidate traces. Use this to understand WHY an operation got slower or faster.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        operation_name: {
+          type: "string",
+          description: "Exact operation name to compare (e.g., aten::mm, CompiledFxGraph_abc).",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of child comparisons to return.",
+        },
+      },
+      required: ["operation_name", "limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "inspect_counters",
+    description:
+      "Return counter track values (GPU utilization, memory usage, etc.) within an optional time range. Use to correlate metrics with specific events.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Counter name substring filter. Use empty string for all counters.",
+        },
+        start_time_us: {
+          type: "number",
+          description: "Optional start time in microseconds to filter samples.",
+        },
+        end_time_us: {
+          type: "number",
+          description: "Optional end time in microseconds to filter samples.",
+        },
+        trace_role: {
+          type: "string",
+          enum: ["baseline", "candidate"],
+          description: 'Which trace. Use "baseline" or "candidate" in Deep Mode.',
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of counter tracks to return.",
+        },
+      },
+      required: ["query", "trace_role", "limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "clone_repo",
+    description:
+      "Clone an attached GitHub repo to a local temp directory for faster file access. IMPORTANT: You MUST ask the user for permission before calling this tool. Explain why you need to clone and wait for their approval.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        repo_id: {
+          type: "string",
+          description: "Opaque attached-repo id from APP_REPO_ATTACHMENT.",
+        },
+      },
+      required: ["repo_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "cleanup_repo_clone",
+    description:
+      "Remove a previously cloned repo from the local temp directory to free disk space.",
+    strict: true,
+    parameters: {
+      type: "object",
+      properties: {
+        repo_id: {
+          type: "string",
+          description: "Opaque attached-repo id from APP_REPO_ATTACHMENT.",
+        },
+      },
+      required: ["repo_id"],
       additionalProperties: false,
     },
   },
